@@ -218,9 +218,66 @@ const sideOf=(t,ship)=>!t?null:t.left===ship?LEFT:t.right===ship?RIGHT:null;
 function follow(){if(UI.table&&S.ready)pokeQuiet({follow:{gid:UI.table.gid,host:UI.table.host}})}
 let lastInput=performance.now(),hbAt=0,refollowAt=0;
 for(const ev of ['pointermove','pointerdown','keydown','wheel','touchstart'])addEventListener(ev,()=>{lastInput=performance.now()},{passive:true,capture:true});
-function idleLeft(){const t=curT();return t&&sideOf(t,S.our)!=null?IDLE_MS-(performance.now()-lastInput):null}
+function idleLeft(){const t=curT();return t&&sideOf(t,S.our)!=null&&heldHere(t.gid)?IDLE_MS-(performance.now()-lastInput):null}
 const idleWarn=left=>'Still there? Your paddle frees in '+Math.max(1,Math.ceil(left/1000))+'s — move your mouse here.';
+
+// ---------- one playing page per ship ----------
+// Every page of this ship shares an origin (Noltbook frames and /apps/pong tabs
+// alike), so a BroadcastChannel reaches all of them. A seat is played from one
+// page at a time: the holder announces itself every 2s, a newcomer defers to it,
+// "Play here" takes over, and if the holder closes or goes quiet another page
+// showing that table picks it up. Two pages claiming at once: first claim wins.
+const PAGE=rid(10),HOLD_BEAT_MS=2000,HOLD_STALE_MS=5000;
+const Hold={ch:null,mine:{},other:{},beatAt:0,readyAt:0};
+function holdPost(m){if(Hold.ch)try{Hold.ch.postMessage(Object.assign({page:PAGE},m))}catch(e){}}
+function holdChanged(){syncSession();renderUI()}
+function onHoldMsg(m){
+  if(!m||typeof m!=='object'||m.page===PAGE)return;
+  if(m.t==='who'){for(const gid of Object.keys(Hold.mine))holdPost({t:'hold',gid,claimAt:Hold.mine[gid]});return}
+  const gid=m.gid;if(typeof gid!=='string')return;
+  if(m.t==='drop'){if(Hold.other[gid]&&Hold.other[gid].page===m.page){delete Hold.other[gid];holdChanged()}return}
+  if(m.t!=='hold'&&m.t!=='take')return;
+  const known=Hold.other[gid]&&Hold.other[gid].page===m.page;
+  Hold.other[gid]={page:m.page,seen:performance.now()};
+  const mine=Hold.mine[gid];
+  if(mine!=null){
+    const theirs=Number(m.claimAt)||0;
+    if(m.t==='take'||theirs<mine||(theirs===mine&&m.page<PAGE)){delete Hold.mine[gid];holdChanged()}
+    else holdPost({t:'hold',gid,claimAt:mine});      // we were first: say so
+  }else if(!known)renderUI();
+}
+try{
+  if(window.BroadcastChannel){
+    Hold.ch=new BroadcastChannel('pong-seat');Hold.ch.onmessage=e=>onHoldMsg(e.data);
+    Hold.readyAt=performance.now()+400;holdPost({t:'who'});   // give a current holder time to answer
+    setTimeout(holdChanged,450);
+  }
+}catch(e){Hold.ch=null}
+addEventListener('pagehide',()=>{for(const gid of Object.keys(Hold.mine))holdPost({t:'drop',gid})});
+const heldHere=gid=>!Hold.ch||Hold.mine[gid]!=null;
+function heldElsewhere(gid){
+  const o=!heldHere(gid)&&Hold.other[gid];
+  return !!o&&performance.now()-o.seen<HOLD_STALE_MS;
+}
+// claim the seat for this page unless another page is playing it
+function canPlay(gid){
+  if(heldHere(gid))return true;
+  if(performance.now()<Hold.readyAt||heldElsewhere(gid))return false;
+  Hold.mine[gid]=Date.now();holdPost({t:'hold',gid,claimAt:Hold.mine[gid]});
+  return true;
+}
+function playHere(gid){Hold.mine[gid]=Date.now();delete Hold.other[gid];holdPost({t:'take',gid});holdChanged()}
+function holdTick(now){
+  // let go of seats we no longer sit in or no longer show; announce the rest
+  for(const gid of Object.keys(Hold.mine)){
+    const t=S.tables[gid];
+    if(!t||sideOf(t,S.our)==null||!UI.table||UI.table.gid!==gid){delete Hold.mine[gid];holdPost({t:'drop',gid})}
+  }
+  if(now-Hold.beatAt>=HOLD_BEAT_MS){Hold.beatAt=now;for(const gid of Object.keys(Hold.mine))holdPost({t:'hold',gid,claimAt:Hold.mine[gid]})}
+}
+
 setInterval(()=>{
+  holdTick(performance.now());
   if(!S.ready||!UI.table)return;
   const now=performance.now(),t=curT();
   if(!t){
@@ -229,6 +286,10 @@ setInterval(()=>{
     return;
   }
   if(sideOf(t,S.our)==null)return;
+  // another page plays this seat: no idle clock, no heartbeat from here
+  const had=heldHere(t.gid);
+  if(!canPlay(t.gid))return;
+  if(!had)holdChanged();
   const left=IDLE_MS-(now-lastInput);
   if(left<=0){
     lastInput=now;
@@ -256,7 +317,7 @@ function wantSession(){
   if(isCpu()||!UI.table||!S.ready)return null;
   const t=curT();if(!t||!t.left||!t.right)return null;
   const me=sideOf(t,S.our),key=t.gid+':'+t.left+':'+t.right;
-  if(me!=null)return{role:'player',gid:t.gid,me,them:me===LEFT?t.right:t.left,key:'p:'+key};
+  if(me!=null)return canPlay(t.gid)?{role:'player',gid:t.gid,me,them:me===LEFT?t.right:t.left,key:'p:'+key}:null;
   if(UI.watch)return{role:'watch',gid:t.gid,players:[t.left,t.right],key:'w:'+key};
   return null;
 }
@@ -780,11 +841,14 @@ function tableCard(){
     c.append(seatRow(t,LEFT),seatRow(t,RIGHT));
     if(t.left&&t.right)c.append(para('Score '+t.score[0]+' – '+t.score[1]));
     const acts=el('div','row');
+    const away=me!=null&&heldElsewhere(g.gid);
+    if(away)c.append(para('You’re playing this table in another tab or window.','dim'));
+    if(away)acts.append(button('Play here',()=>playHere(g.gid)));
     if(me!=null)acts.append(button('Stand up',standUp,'ghost'));
     if(me==null&&t.left&&t.right)acts.append(button('Watch live',()=>{UI.watch=true;syncSession();renderUI()}));
     if(t.host===S.our)acts.append(button('Close table',()=>act({close:{gid:g.gid}}),'ghost'));
     if(acts.childNodes.length)c.append(acts);
-    if(me!=null&&!(t.left&&t.right))c.append(para('Waiting for someone to take the other paddle.','dim'));
+    if(me!=null&&!away&&!(t.left&&t.right))c.append(para('Waiting for someone to take the other paddle.','dim'));
     const il=idleLeft();if(il!=null&&il<IDLE_WARN_MS)c.append(el('div','err',idleWarn(il)));
   }
   if(note)c.append(el('div','err',note));

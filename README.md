@@ -25,6 +25,9 @@ A paddle is given up after 2 minutes without mouse or keyboard activity in the
 Pong frame, with a warning first. If a player's page closes, the table's ship
 frees the paddle after 90 seconds without a heartbeat.
 
+If you have the same table open in several tabs, only one of them plays; the
+others offer **Play here** to move the game over.
+
 ## How it works
 
 - `app/pong.hoon` keeps the tables this ship hosts (who holds which paddle, and

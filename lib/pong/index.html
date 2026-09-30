@@ -1,0 +1,629 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pong</title>
+<style>
+:root{color-scheme:dark;--bg:#000;--fg:#f2f2f2;--dim:#8c8c8c;--line:#2b2b2b;--err:#ff6b6b}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow:hidden}
+#app{height:100%;display:flex;flex-direction:column}
+.bar{display:flex;align-items:center;gap:12px;padding:6px 12px;border-bottom:1px solid var(--line);min-height:36px}
+.brand{font-weight:700;letter-spacing:.35em}
+.status{flex:1;min-width:0;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.btns{display:flex;gap:6px}
+button{font:inherit;color:var(--fg);background:none;border:1px solid var(--fg);padding:4px 12px;cursor:pointer;white-space:nowrap}
+button:hover:not(:disabled){background:var(--fg);color:var(--bg)}
+button:disabled{opacity:.4;cursor:default}
+button.ghost{border-color:var(--line);color:var(--dim)}
+button.ghost:hover:not(:disabled){border-color:var(--fg);background:none;color:var(--fg)}
+input{font:inherit;color:var(--fg);background:#0b0b0b;border:1px solid var(--line);padding:5px 8px;min-width:0;flex:1}
+input:focus{outline:none;border-color:var(--fg)}
+#stage{position:relative;flex:1;min-height:0;display:flex;align-items:center;justify-content:center}
+#field{display:block;touch-action:none}
+.panel{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(0,0,0,.78);overflow:auto}
+.card{width:min(460px,100%);max-height:100%;overflow:auto;border:1px solid var(--line);background:#000;padding:16px;display:flex;flex-direction:column;gap:10px}
+.card h2{margin:6px 0 0;font-size:11px;font-weight:400;letter-spacing:.25em;color:var(--dim)}
+.card h2:first-child{margin-top:0}
+.card p{margin:0}
+.row{display:flex;gap:8px;align-items:center}
+.list{display:flex;flex-direction:column;gap:6px}
+.item{display:flex;gap:6px;align-items:center;border:1px solid var(--line);padding:6px 8px}
+.item .who{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dim{color:var(--dim)}
+.err{color:var(--err)}
+.msg{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);display:flex;flex-direction:column;align-items:center;gap:10px;text-align:center;pointer-events:none;padding:14px 20px;background:rgba(0,0,0,.65);max-width:calc(100% - 32px)}
+.msg button{pointer-events:auto}
+.msg .big{font-size:40px;font-weight:700;letter-spacing:.2em;line-height:1.1}
+.msg .sub{color:var(--dim)}
+.msg[hidden],.panel[hidden]{display:none}
+body[data-view=tool] #field,body[data-view=tool] .bar{display:none}
+body[data-view=tool] .panel{background:none;padding:12px 14px}
+body[data-view=tool] .card{border:0;padding:0;width:100%;gap:12px}
+@media (max-width:420px){.bar{gap:8px;padding:6px 10px}.brand{letter-spacing:.2em}.msg .big{font-size:28px}}
+</style>
+</head>
+<body>
+<div id="app">
+  <header class="bar">
+    <span class="brand">PONG</span>
+    <span id="status" class="status">connecting…</span>
+    <span id="barBtns" class="btns"></span>
+  </header>
+  <main id="stage">
+    <canvas id="field" width="800" height="500"></canvas>
+    <div id="msg" class="msg" hidden></div>
+    <div id="panel" class="panel" hidden></div>
+  </main>
+</div>
+<script>
+'use strict';
+// %pong frontend. The agent seats two ships and relays opaque messages between
+// them; everything about the game itself happens here.
+//
+// Netcode in one paragraph: host is the left paddle, guest the right. Each side
+// is the authority for hits and misses on ITS OWN paddle, so what you see on
+// your paddle is what counts. Between those events the ball moves in straight
+// lines, so both sides simulate it; the far side's outcome is predicted and then
+// corrected when the owner's verdict ('b' or 'pt') arrives. Remote events are
+// fast-forwarded by half the measured round trip. Paddles go out at ~16 Hz.
+
+// ---------- field (logical units; both ships must agree) ----------
+const W=800,H=500,BALL=12,PW=12,PH=80,PX=24;
+const LFACE=PX+PW,RFACE=W-PX-PW;                // the faces the ball strikes
+const LEFT=0,RIGHT=1;
+const SPEED0=420,SPEEDUP=1.05,SPEEDMAX=980,MAXANG=Math.PI*0.3;
+const CPU_SPEED=320,CPU_ERR=0.65,CPU_REACT=0.4;   // tuned so a 90% returner wins ~58% of points
+const STEP=1/240,WIN=11;
+const SERVE_MS=1000,COUNT_MS=3000,PADDLE_MS=60,PING_MS=2000,HI_MS=1000,STALL_MS=5000;
+const SHIP_RE=/^~[a-z]{3}(?:[a-z]{3})?(?:-[a-z]{6})*(?:--[a-z]{6}(?:-[a-z]{6})*)?$/;
+
+const $=id=>document.getElementById(id);
+function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e}
+function button(label,fn,cls){const b=el('button',cls||'',label);b.addEventListener('click',fn);return b}
+function para(text,cls){return el('p',cls||'',text)}
+function rid(n){const a=new Uint8Array(n);crypto.getRandomValues(a);return Array.from(a,x=>(x%36).toString(36)).join('')}
+const clampPad=y=>Math.max(PH/2,Math.min(H-PH/2,y));
+
+// ---------- sound ----------
+let AC=null;
+function unlockAudio(){
+  try{
+    if(!AC){const C=window.AudioContext||window.webkitAudioContext;if(C)AC=new C()}
+    if(AC&&AC.state==='suspended')AC.resume();
+  }catch(e){}
+}
+function tone(freq,ms,vol){
+  if(!AC||AC.state!=='running')return;
+  const t=AC.currentTime,o=AC.createOscillator(),g=AC.createGain();
+  o.type='square';o.frequency.value=freq;
+  g.gain.setValueAtTime(vol,t);g.gain.exponentialRampToValueAtTime(0.0001,t+ms/1000);
+  o.connect(g);g.connect(AC.destination);o.start(t);o.stop(t+ms/1000+0.02);
+}
+const sfx={paddle:()=>tone(480,55,0.10),wall:()=>tone(240,35,0.06),score:()=>tone(160,300,0.10)};
+addEventListener('pointerdown',unlockAudio,true);
+addEventListener('keydown',unlockAudio,true);
+
+// ---------- Eyre channel ----------
+// PUTs are serialized (one in flight, the rest batched) so pokes reach the agent,
+// and therefore the other ship, in the order they were made.
+const Chan={ship:null,url:null,id:0,es:null,q:[],busy:false,ack:-1,acked:-1,sub:null,wait:new Map(),ackTimer:null,retry:0};
+function put(url,actions){return fetch(url,{method:'PUT',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify(actions)})}
+async function connect(){
+  if(Chan.es){try{Chan.es.close()}catch(e){}Chan.es=null}
+  if(Chan.url)put(Chan.url,[{id:++Chan.id,action:'delete'}]).catch(()=>{});
+  for(const res of Chan.wait.values())res('reconnected');
+  Chan.wait.clear();
+  Chan.url='/~/channel/pong-'+Date.now().toString(36)+'-'+rid(6);
+  Chan.id=0;Chan.ack=-1;Chan.acked=-1;Chan.q=[];Chan.busy=false;
+  const url=Chan.url;
+  try{
+    if(!Chan.ship){
+      const r=await fetch('/~/host',{credentials:'include'});
+      if(!r.ok)throw new Error('host '+r.status);
+      Chan.ship=(await r.text()).trim().replace(/^~/,'');
+    }
+    Chan.sub=++Chan.id;
+    const r=await put(url,[{id:Chan.sub,action:'subscribe',ship:Chan.ship,app:'pong',path:'/updates'}]);
+    if(!r.ok)throw new Error('channel '+r.status);
+  }catch(e){
+    if(Chan.url!==url)return;
+    S.error='Cannot reach your ship ('+(e.message||e)+').';renderUI();retryConnect();return;
+  }
+  if(Chan.url!==url)return;
+  const es=new EventSource(url,{withCredentials:true});Chan.es=es;
+  es.onopen=()=>{Chan.retry=0};
+  es.onmessage=onSse;
+  es.onerror=()=>{if(Chan.es!==es)return;try{es.close()}catch(x){}Chan.es=null;retryConnect()};
+}
+function retryConnect(){Chan.retry=Math.min(Chan.retry+1,6);setTimeout(connect,500*Chan.retry)}
+function onSse(e){
+  const n=parseInt(e.lastEventId,10);
+  if(!isNaN(n)&&n>Chan.ack){Chan.ack=n;scheduleAck()}
+  let d;try{d=JSON.parse(e.data)}catch(x){return}
+  if(d.response==='poke'){const res=Chan.wait.get(d.id);if(res){Chan.wait.delete(d.id);res(d.err?String(d.err):null)}return}
+  if(d.id!==Chan.sub)return;
+  if(d.response==='subscribe'){if(d.err){S.error='Subscription refused by %pong.';renderUI()}return}
+  if(d.response==='diff'){onFact(d.json);return}
+  if(d.response==='quit'){Chan.sub=++Chan.id;enqueue({id:Chan.sub,action:'subscribe',ship:Chan.ship,app:'pong',path:'/updates'})}
+}
+// tag: a later action with the same tag replaces a queued one (paddle positions)
+function enqueue(action,tag){
+  if(tag){const i=Chan.q.findIndex(x=>x.tag===tag);if(i>=0)Chan.q.splice(i,1)}
+  Chan.q.push({action,tag});flush();
+}
+function flush(){
+  if(Chan.busy||!Chan.url||!Chan.ship)return;
+  const batch=Chan.q.splice(0).map(x=>x.action);
+  if(Chan.ack>Chan.acked){batch.push({id:++Chan.id,action:'ack','event-id':Chan.ack});Chan.acked=Chan.ack}
+  if(!batch.length)return;
+  Chan.busy=true;const url=Chan.url;
+  put(url,batch).catch(()=>{}).finally(()=>{
+    if(Chan.url!==url)return;
+    Chan.busy=false;
+    if(Chan.q.length)flush();else if(Chan.ack>Chan.acked)scheduleAck();
+  });
+}
+function scheduleAck(){if(Chan.ackTimer)return;Chan.ackTimer=setTimeout(()=>{Chan.ackTimer=null;flush()},400)}
+// resolves null on ack, or the error text on nack
+function poke(json){return new Promise(res=>{const id=++Chan.id;Chan.wait.set(id,res);enqueue({id,action:'poke',ship:Chan.ship,app:'pong',mark:'pong-action',json})})}
+function pokeQuiet(json,tag){enqueue({id:++Chan.id,action:'poke',ship:Chan.ship,app:'pong',mark:'pong-action',json},tag)}
+
+// ---------- lobby state (mirrors the agent) ----------
+const S={ready:false,our:null,games:{},notes:{},error:null};
+const UI={view:'boot',table:null,focus:null,follow:null,err:'',busy:false,toolMsg:'',dropped:null};
+function onFact(j){
+  if(!j||typeof j!=='object')return;
+  if(j.relay){let m=null;try{m=JSON.parse(j.relay.body)}catch(e){}if(m&&typeof m==='object')onRelay(j.relay.gid,m);return}
+  if(j.games){S.our=j.our;S.games={};for(const g of j.games)S.games[g.gid]=g;S.ready=true;S.error=null}
+  if(j.game){
+    const prev=S.games[j.game.gid];S.games[j.game.gid]=j.game;
+    // open a game when it goes live, but only if this page asked for it
+    if(j.game.status==='live'&&(!prev||prev.status!=='live')&&UI.view==='lobby'&&UI.follow===j.game.gid&&!isCpu()){UI.focus=j.game.gid;UI.follow=null}
+  }
+  if(j.gone){delete S.games[j.gone];delete S.notes[j.gone]}
+  if(j.note)S.notes[j.note.gid]=j.note.text;
+  syncAttach();renderUI();
+}
+async function act(json,failText){
+  const err=await poke(json);
+  if(err){
+    console.warn('[pong] poke failed',json,err);
+    const why=err==='reconnected'?'connection dropped, try again'
+      :String(err).split('\n').map(l=>l.trim()).filter(Boolean).slice(0,3).join(' / ').slice(0,200);
+    UI.err=(failText||'Your ship refused that.')+' ('+why+')';renderUI();
+  }
+  return !err;
+}
+function leave(gid){
+  if(Net&&Net.gid===gid)detach();
+  if(UI.focus===gid)UI.focus=null;
+  act({leave:{gid}});renderUI();
+}
+function join(gid,host){UI.follow=gid;UI.err='';act({join:{gid,host}},'Could not ask for a seat.')}
+
+// ---------- attaching to a live game ----------
+let Net=null,G=null;
+const isCpu=()=>!!G&&G.mode==='cpu';
+function wantedGid(){
+  if(isCpu())return null;
+  const gid=UI.view==='table'?UI.table.gid:UI.view==='lobby'?UI.focus:null;
+  const g=gid&&S.games[gid];
+  return g&&g.status==='live'?gid:null;
+}
+function syncAttach(){
+  const want=wantedGid();
+  if(Net&&Net.gid!==want)detach();
+  if(want&&!Net)attach(want);
+}
+function attach(gid){
+  const g=S.games[gid],host=g.host===S.our;
+  Net={gid,host,them:host?g.guest:g.host,sid:rid(10),peer:null,heard:false,linked:false,rtt:150,lastRx:0,lastPy:null,lastPAt:0,hiAt:0,pingAt:0};
+  G=newGame('net',host?LEFT:RIGHT);
+  unlockAudio();sendHi();
+}
+function detach(){Net=null;if(G&&G.mode==='net')G=null}
+function netSend(m,tag){if(Net)pokeQuiet({relay:{gid:Net.gid,body:JSON.stringify(m)}},tag?Net.gid+':'+tag:null)}
+function sendHi(){Net.hiAt=performance.now();netSend({t:'hi',sid:Net.sid,seen:Net.peer})}
+const lat=()=>Net?Math.min(250,Math.max(0,Net.rtt/2))/1000:0;
+function netTick(now){
+  if(!Net)return;
+  if(!Net.linked&&now-Net.hiAt>HI_MS)sendHi();
+  if(!Net.linked)return;
+  if(now-Net.pingAt>PING_MS){Net.pingAt=now;netSend({t:'ping',ts:now})}
+  const y=Math.round(G.pad[G.me]*10)/10;
+  if(y!==Net.lastPy&&now-Net.lastPAt>=PADDLE_MS){Net.lastPy=y;Net.lastPAt=now;netSend({t:'p',y},'p')}
+}
+function onRelay(gid,m){
+  if(!Net||Net.gid!==gid||!G)return;
+  const now=performance.now();Net.lastRx=now;
+  switch(m.t){
+    case 'hi':onHi(m);break;
+    case 'ping':netSend({t:'pong',ts:m.ts});break;
+    case 'pong':{const s=now-Number(m.ts);if(s>=0&&s<5000)Net.rtt=Net.rtt*0.7+s*0.3;break}
+    case 'p':if(Number.isFinite(m.y))G.pad[1-G.me]=clampPad(m.y);break;
+    case 'go':if(!Net.host&&Number.isFinite(m.m)){Net.linked=true;startMatch(m.m)}break;
+    case 'b':if(m.m===G.m)adoptBall(m);break;
+    case 'pt':if(m.m===G.m)adoptPoint(m);break;
+    case 'again':if(m.m===G.m){G.peerAgain=true;maybeRematch()}break;
+  }
+}
+// Handshake: each page has a session id. Linked once we know the other page's id
+// AND it has echoed ours. A new id from the other side means it reloaded: reset.
+function onHi(m){
+  if(typeof m.sid!=='string')return;
+  if(m.sid!==Net.peer){
+    const me=G.me;
+    Net.peer=m.sid;Net.heard=false;Net.linked=false;
+    G=newGame('net',me);
+    sendHi();
+  }else if(m.seen!==Net.sid&&Net.linked)sendHi();
+  if(m.seen===Net.sid)Net.heard=true;
+  if(!Net.linked&&Net.peer&&Net.heard){
+    Net.linked=true;Net.lastRx=performance.now();Net.pingAt=0;
+    if(Net.host)hostStart();
+  }
+}
+function hostStart(){const m=1+Math.floor(Math.random()*1e9);netSend({t:'go',m});startMatch(m)}
+
+// ---------- match ----------
+function newGame(mode,me){
+  return{mode,me,m:0,pad:[H/2,H/2],show:[H/2,H/2],score:[0,0],
+    ball:{x:W/2-BALL/2,y:H/2-BALL/2,vx:0,vy:0,live:false,spec:false,frozen:false},
+    k:0,phase:'wait',countEnd:0,serveAt:0,serveBy:null,serveDir:0,
+    corr:{x:0,y:0},predHit:false,wantAgain:false,peerAgain:false,cpuErr:0,acc:0};
+}
+const mine=side=>G.mode==='cpu'||side===G.me;
+function startMatch(m){
+  const keep=G.pad.slice();
+  G=newGame(G.mode,G.me);G.pad=keep;G.show=keep.slice();G.m=m;
+  const now=performance.now();
+  G.phase='count';
+  G.countEnd=now+COUNT_MS-(Net&&!Net.host?lat()*1000:0);
+  G.serveBy=LEFT;G.serveAt=now+COUNT_MS;           // host (or you, vs CPU) serves first
+  unlockAudio();
+}
+function serve(){
+  const b=G.ball,dir=G.serveDir||(Math.random()<0.5?-1:1),a=(Math.random()*2-1)*0.45;
+  b.x=W/2-BALL/2;b.y=H/2-BALL/2+(Math.random()*2-1)*H*0.25;
+  b.vx=dir*SPEED0*Math.cos(a);b.vy=SPEED0*Math.sin(a);
+  b.live=true;b.spec=false;b.frozen=false;G.corr={x:0,y:0};G.predHit=false;
+  G.k++;G.phase='play';G.serveBy=null;
+  netSend({t:'b',m:G.m,k:G.k,x:b.x,y:b.y,vx:b.vx,vy:b.vy,e:'serve'});
+}
+function simStep(dt){
+  const b=G.ball;if(!b.live||b.frozen)return;
+  const px=b.x;
+  b.x+=b.vx*dt;b.y+=b.vy*dt;
+  if(b.y<0){b.y=-b.y;b.vy=Math.abs(b.vy);sfx.wall()}
+  else if(b.y>H-BALL){b.y=2*(H-BALL)-b.y;b.vy=-Math.abs(b.vy);sfx.wall()}
+  if(b.vx<0&&px>=LFACE&&b.x<LFACE)cross(LEFT);
+  else if(b.vx>0&&px+BALL<=RFACE&&b.x+BALL>RFACE)cross(RIGHT);
+  if(b.x+BALL<0)goal(LEFT);else if(b.x>W)goal(RIGHT);
+}
+function cross(side){
+  const b=G.ball,py=G.pad[side];
+  const hit=b.y+BALL>=py-PH/2&&b.y<=py+PH/2;
+  if(mine(side)&&!b.spec){
+    if(!hit)return;                                 // a miss is settled at the goal line
+    bounce(side);G.k++;sfx.paddle();
+    netSend({t:'b',m:G.m,k:G.k,x:b.x,y:b.y,vx:b.vx,vy:b.vy,e:'hit'});
+  }else{
+    // not ours to call: guess from their last known paddle, the owner corrects us
+    b.spec=true;
+    if(hit){bounce(side);sfx.paddle();G.predHit=true}
+  }
+}
+function bounce(side){
+  const b=G.ball,py=G.pad[side];
+  const rel=Math.max(-1,Math.min(1,((b.y+BALL/2)-py)/(PH/2+BALL/2)));
+  const sp=Math.min(SPEEDMAX,Math.hypot(b.vx,b.vy)*SPEEDUP),a=rel*MAXANG;
+  b.vx=(side===LEFT?1:-1)*sp*Math.cos(a);b.vy=sp*Math.sin(a);
+  b.x=side===LEFT?LFACE:RFACE-BALL;
+  if(G.mode==='cpu'&&side===LEFT)G.cpuErr=(Math.random()*2-1)*PH*CPU_ERR;
+}
+function goal(side){
+  if(mine(side)&&!G.ball.spec){concede(side);return}
+  G.ball.frozen=true;                               // hold until the owner rules
+}
+function concede(side){
+  G.ball.live=false;G.score[1-side]++;G.k++;sfx.score();
+  netSend({t:'pt',m:G.m,k:G.k,s:G.score.slice()});
+  afterPoint(side);
+}
+function afterPoint(conceder){
+  G.predHit=false;
+  if(G.score[0]>=WIN||G.score[1]>=WIN){G.phase='over';G.serveBy=null;return}
+  G.phase='point';G.serveBy=conceder;G.serveDir=conceder===LEFT?-1:1;G.serveAt=performance.now()+SERVE_MS;
+}
+function fastForward(sec){
+  const b=G.ball;
+  for(let t=sec;t>0;t-=STEP){
+    const dt=Math.min(STEP,t);b.x+=b.vx*dt;b.y+=b.vy*dt;
+    if(b.y<0){b.y=-b.y;b.vy=Math.abs(b.vy)}else if(b.y>H-BALL){b.y=2*(H-BALL)-b.y;b.vy=-Math.abs(b.vy)}
+  }
+}
+function adoptBall(m){
+  if(!(m.k>G.k)||![m.x,m.y,m.vx,m.vy].every(Number.isFinite))return;
+  const b=G.ball,was=(b.live&&!b.frozen)?{x:b.x,y:b.y}:null;
+  G.k=m.k;
+  b.x=m.x;b.y=m.y;b.vx=m.vx;b.vy=m.vy;b.live=true;b.spec=false;b.frozen=false;
+  fastForward(lat());
+  // small corrections glide; big ones (a wrong guess) snap
+  if(was&&Math.hypot(was.x-b.x,was.y-b.y)<80){G.corr.x+=was.x-b.x;G.corr.y+=was.y-b.y}else G.corr={x:0,y:0};
+  if(m.e==='hit'&&!G.predHit)sfx.paddle();
+  G.predHit=false;G.phase='play';G.serveBy=null;
+}
+function adoptPoint(m){
+  if(!(m.k>G.k)||!Array.isArray(m.s)||m.s.length!==2)return;
+  G.k=m.k;G.score=[m.s[0]|0,m.s[1]|0];G.ball.live=false;G.corr={x:0,y:0};sfx.score();
+  afterPoint(1-G.me);
+}
+function askRematch(){
+  if(isCpu()){startMatch(0);renderUI();return}
+  G.wantAgain=true;netSend({t:'again',m:G.m});maybeRematch();
+}
+function maybeRematch(){if(Net&&Net.host&&G.phase==='over'&&G.wantAgain&&G.peerAgain)hostStart()}
+function cpuTick(dt){
+  const b=G.ball,target=(b.live&&b.vx>0&&b.x>W*CPU_REACT)?b.y+BALL/2+G.cpuErr:H/2,cur=G.pad[RIGHT],step=CPU_SPEED*dt;
+  G.pad[RIGHT]=clampPad(cur+Math.max(-step,Math.min(step,target-cur)));
+}
+function startCpu(){
+  UI.focus=null;detach();
+  G=newGame('cpu',LEFT);startMatch(0);renderUI();
+}
+function quitCpu(){G=null;renderUI()}
+
+// ---------- input ----------
+let pointerY=null;
+function onPointer(e){const r=cv.getBoundingClientRect();if(r.height>0)pointerY=(e.clientY-r.top)/r.height*H}
+addEventListener('pointermove',onPointer,{passive:true});
+addEventListener('pointerdown',onPointer,{passive:true});
+
+// ---------- drawing ----------
+const cv=$('field'),ctx=cv.getContext('2d');
+const DIG=['111101101101111','010110010010111','111001111100111','111001111001111','101101111001001',
+           '111100111001111','111100111101111','111001001001001','111101111101111','111101111001111'];
+function fitCanvas(){
+  const r=$('stage').getBoundingClientRect();
+  let w=Math.max(100,r.width-16),h=w/1.6;
+  if(h>r.height-16){h=Math.max(62,r.height-16);w=h*1.6}
+  cv.style.width=Math.floor(w)+'px';cv.style.height=Math.floor(h)+'px';
+  const dpr=Math.min(2,window.devicePixelRatio||1);
+  cv.width=Math.round(w*dpr);cv.height=Math.round(h*dpr);
+}
+function drawScore(n,x,y,alignRight){
+  const str=String(n),cell=8,dw=3*cell,gap=cell,tw=str.length*dw+(str.length-1)*gap;
+  let sx=alignRight?x-tw:x;
+  for(const ch of str){
+    const bits=DIG[+ch];
+    for(let i=0;i<15;i++)if(bits[i]==='1')ctx.fillRect(sx+(i%3)*cell,y+Math.floor(i/3)*cell,cell,cell);
+    sx+=dw+gap;
+  }
+}
+const IDLE=newGame('idle',LEFT);
+function draw(){
+  const s=cv.width/W,g=G||IDLE,b=g.ball;
+  ctx.setTransform(s,0,0,s,0,0);
+  ctx.fillStyle='#000';ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#555';for(let y=6;y<H;y+=26)ctx.fillRect(W/2-2,y,4,14);
+  ctx.fillStyle='#f2f2f2';
+  drawScore(g.score[0],W/2-44,24,true);drawScore(g.score[1],W/2+44,24,false);
+  ctx.fillRect(PX,Math.round(g.show[0]-PH/2),PW,PH);
+  ctx.fillRect(W-PX-PW,Math.round(g.show[1]-PH/2),PW,PH);
+  if(b.live&&!b.frozen)ctx.fillRect(Math.round(b.x+g.corr.x),Math.round(b.y+g.corr.y),BALL,BALL);
+  const names=!G?null:isCpu()?['you','cpu']:Net?(Net.host?['you',Net.them]:[Net.them,'you']):null;
+  if(names){
+    ctx.font='13px ui-monospace,Menlo,monospace';ctx.textBaseline='bottom';
+    ctx.fillStyle=names[0]==='you'?'#cfcfcf':'#6a6a6a';ctx.textAlign='left';ctx.fillText(names[0],PX,H-8);
+    ctx.fillStyle=names[1]==='you'?'#cfcfcf':'#6a6a6a';ctx.textAlign='right';ctx.fillText(names[1],W-PX,H-8);
+  }
+}
+
+// ---------- overlays ----------
+function msgState(now){
+  if(!G)return null;
+  const them=isCpu()?'CPU':Net?Net.them:'';
+  if(G.mode==='net'&&!Net.linked)return{key:'wait',text:'Waiting for '+them+' to open the game…'};
+  if(G.phase==='count'&&now<G.countEnd){const n=Math.max(1,Math.ceil((G.countEnd-now)/1000));return{key:'c'+n,big:String(n)}}
+  if(G.phase==='over'){
+    const won=G.score[G.me]>G.score[1-G.me],sc=G.score[G.me]+' – '+G.score[1-G.me];
+    const big=won?'YOU WIN':isCpu()?'CPU WINS':'YOU LOSE';
+    if(isCpu())return{key:'over-cpu',big,text:sc,btns:[['Play again',askRematch],['Quit',quitCpu,'ghost']]};
+    const text=G.wantAgain?'Waiting for '+them+'…':G.peerAgain?them+' wants a rematch':sc;
+    return{key:'over-'+G.wantAgain+G.peerAgain,big,text,btns:[['Rematch',askRematch,'',G.wantAgain],['Leave',()=>leave(Net.gid),'ghost']]};
+  }
+  if(Net&&now-Net.lastRx>STALL_MS)return{key:'stall',text:'Lost contact with '+them+'…'};
+  return null;
+}
+let msgKey='';
+function updateMsg(now){
+  const st=$('panel').hidden?msgState(now):null,key=st?st.key:'';
+  cv.style.cursor=(G&&!st&&$('panel').hidden)?'none':'default';
+  if(key===msgKey)return;msgKey=key;
+  const box=$('msg');box.textContent='';
+  if(!st){box.hidden=true;return}
+  if(st.big)box.append(el('div','big',st.big));
+  if(st.text)box.append(el('div','sub',st.text));
+  if(st.btns){const r=el('div','row');for(const [label,fn,cls,off] of st.btns){const b=button(label,fn,cls);b.disabled=!!off;r.append(b)}box.append(r)}
+  box.hidden=false;
+}
+function statusText(){
+  if(!S.ready)return S.error?'offline':'connecting…';
+  if(isCpu())return 'practice vs CPU';
+  if(Net)return (Net.host?'left':'right')+' paddle vs '+Net.them+(Net.linked?' · '+Math.round(Net.rtt)+' ms':'');
+  if(UI.view==='table')return UI.table.host===S.our?'your table':UI.table.host+'’s table';
+  return S.our||'';
+}
+
+// ---------- panels ----------
+const shipInput=el('input');shipInput.placeholder='~sampel-palnet';shipInput.spellcheck=false;shipInput.autocomplete='off';
+shipInput.addEventListener('keydown',e=>{if(e.key==='Enter')challenge()});
+async function challenge(){
+  let v=shipInput.value.trim().toLowerCase();if(v&&v[0]!=='~')v='~'+v;
+  if(!SHIP_RE.test(v)){UI.err='Enter a ship, like ~sampel-palnet.';renderUI();return}
+  if(v===S.our){UI.err='That’s you.';renderUI();return}
+  const gid=rid(10);UI.err='';UI.follow=gid;
+  if(await act({challenge:{gid,who:v}},'Challenge failed.'))shipInput.value='';
+}
+function lobbyCard(){
+  const c=el('div','card'),row=el('div','row');
+  c.append(el('h2',null,'CHALLENGE A SHIP'));
+  const slot=el('span');slot.dataset.slot='ship';     // the live input is moved in after placement
+  row.append(slot,button('Challenge',challenge));c.append(row);
+  if(UI.err)c.append(el('div','err',UI.err));
+  const games=Object.values(S.games).sort((a,b)=>b.created-a.created);
+  if(games.length){const list=el('div','list');for(const g of games)list.append(gameRow(g));c.append(el('h2',null,'GAMES'),list)}
+  c.append(el('h2',null,'PRACTICE'),button('Play vs CPU',startCpu));
+  return c;
+}
+function gameRow(g){
+  const them=g.host===S.our?g.guest:g.host,row=el('div','item'),who=el('div','who');
+  let text,btns;
+  switch(g.status){
+    case 'open':text='Open table in a note — waiting';btns=[button('Close',()=>leave(g.gid),'ghost')];break;
+    case 'invited':text='Challenged '+them+' — waiting';btns=[button('Cancel',()=>leave(g.gid),'ghost')];break;
+    case 'incoming':text=them+' challenges you';btns=[button('Play',()=>join(g.gid,g.host)),button('Decline',()=>leave(g.gid),'ghost')];break;
+    case 'joining':text='Joining '+them+'…';btns=[button('Cancel',()=>leave(g.gid),'ghost')];break;
+    case 'live':text='vs '+them;btns=[button('Play',()=>{UI.focus=g.gid;syncAttach();renderUI()}),button('Leave',()=>leave(g.gid),'ghost')];break;
+    default:text=(them||'table')+' — '+(S.notes[g.gid]||'ended');btns=[button('Dismiss',()=>leave(g.gid),'ghost')];
+  }
+  who.textContent=text;who.title=text;row.append(who,...btns);return row;
+}
+function endedCard(g){
+  const them=g.host===S.our?g.guest:g.host,c=el('div','card');
+  c.append(el('h2',null,'GAME OVER'),para(S.notes[g.gid]||(them+' left.')),button('Back',()=>leave(g.gid)));
+  return c;
+}
+function tableCard(){
+  const t=UI.table,g=S.games[t.gid],c=el('div','card'),note=g&&S.notes[g.gid];
+  c.append(el('h2',null,'PONG TABLE'));
+  if(t.host===S.our){
+    if(!g){c.append(para('This table is closed.'),button('Reopen table',()=>act({host:{gid:t.gid}},'Could not reopen.')))}
+    else if(g.status==='open'){
+      c.append(para('Your table is open. Anyone in this note can take the other paddle. First to 11.'));
+      if(note)c.append(el('div','dim',note));
+      c.append(button('Close table',()=>leave(t.gid),'ghost'));
+    }else{c.append(para(note||'This table is closed.'),button('Dismiss',()=>leave(t.gid),'ghost'))}
+  }else if(g&&g.status==='joining'){
+    c.append(para('Asking '+t.host+' for a seat…'),button('Cancel',()=>leave(t.gid),'ghost'));
+  }else{
+    c.append(para(t.host+' is hosting a Pong table. First to 11.'));
+    if(note)c.append(el('div','err',note));
+    c.append(button('Take the other paddle',()=>join(t.gid,t.host)));
+  }
+  if(UI.err)c.append(el('div','err',UI.err));
+  return c;
+}
+function toolCard(){
+  const c=el('div','card'),b=button(UI.busy?'Dropping…':'Drop table',dropTable);
+  b.disabled=UI.busy;
+  c.append(para('Drop a Pong table into this note. Anyone here can take the other paddle — first to 11.'),b);
+  if(UI.toolMsg)c.append(el('div','err',UI.toolMsg));
+  return c;
+}
+function msgCard(title,text){const c=el('div','card');c.append(el('h2',null,title),para(text));return c}
+// Swap in new DOM only when it differs: a redundant rebuild between mousedown and
+// mouseup would eat the click.
+function place(box,node){
+  const html=node?node.outerHTML:'';
+  if(box._html===html)return;
+  box._html=html;box.textContent='';if(node)box.append(node);
+}
+function renderUI(){
+  const hadFocus=document.activeElement===shipInput;
+  let card=null,btn=null;
+  if(!S.ready)card=msgCard(S.error?'OFFLINE':'CONNECTING',S.error||'Reaching your ship…');
+  else if(UI.view==='tool')card=toolCard();
+  else if(UI.view==='bad')card=msgCard('PONG','This artifact has no table in it.');
+  else if(isCpu())btn=button('Quit',quitCpu,'ghost');
+  else if(Net){const gid=Net.gid;btn=button('Leave',()=>leave(gid),'ghost')}
+  else if(UI.view==='table')card=tableCard();
+  else{
+    const g=UI.focus&&S.games[UI.focus];
+    if(UI.focus&&(!g||g.status!=='over'))UI.focus=null;
+    card=g&&UI.focus?endedCard(g):lobbyCard();
+  }
+  place($('barBtns'),btn);place($('panel'),card);$('panel').hidden=!card;
+  const slot=$('panel').querySelector('[data-slot=ship]');if(slot)slot.replaceWith(shipInput);
+  if(hadFocus&&shipInput.isConnected)shipInput.focus();
+}
+
+// ---------- main loop ----------
+let lastT=performance.now(),statusAt=0;
+function frame(now){
+  const dt=Math.min(0.5,Math.max(0,(now-lastT)/1000));lastT=now;
+  if(G){
+    if(pointerY!=null)G.pad[G.me]=clampPad(pointerY);
+    if(isCpu())cpuTick(dt);
+    netTick(now);
+    if((G.phase==='count'||G.phase==='point')&&G.serveBy!=null&&mine(G.serveBy)&&now>=G.serveAt)serve();
+    G.acc+=dt;
+    while(G.acc>=STEP){G.acc-=STEP;if(G.phase==='play')simStep(STEP)}
+    const o=1-G.me,k=1-Math.exp(-dt*30);
+    G.show[G.me]=G.pad[G.me];
+    G.show[o]=isCpu()?G.pad[o]:G.show[o]+(G.pad[o]-G.show[o])*k;
+    const d=Math.exp(-dt*18);G.corr.x*=d;G.corr.y*=d;
+  }
+  draw();updateMsg(now);
+  if(now-statusAt>250){statusAt=now;$('status').textContent=statusText()}
+  requestAnimationFrame(frame);
+}
+
+// ---------- Noltbook bridge + boot ----------
+// Works three ways: inside Noltbook (nb:init says which surface), inside any
+// other same-origin iframe, or as a plain page. ?gid=&host= opens one table.
+const NB={session:null,ctx:null},framed=window.parent!==window;
+function nbSend(type,payload){if(framed)window.parent.postMessage({source:'noltbook-plugin',protocol:1,session:NB.session,type,payload:payload||{}},'*')}
+addEventListener('message',e=>{
+  if(!framed||e.source!==window.parent)return;
+  const d=e.data;if(!d||d.source!=='noltbook-host'||d.protocol!==1)return;
+  if(d.type==='nb:init'){if(!NB.ctx){NB.session=d.session;NB.ctx=d.payload||{};boot(NB.ctx)}return}
+  if(d.session!==NB.session)return;
+  if(d.type==='nb:publish-result'){
+    const p=d.payload||{};
+    if(p.ok){nbSend('nb:close');return}
+    UI.busy=false;UI.toolMsg='Could not add the table to this note.';
+    if(UI.dropped){act({leave:{gid:UI.dropped}});UI.dropped=null}
+    renderUI();
+  }
+});
+async function dropTable(){
+  if(UI.busy)return;
+  UI.busy=true;UI.toolMsg='';renderUI();
+  const gid=rid(10);
+  if(!await act({host:{gid}})){UI.busy=false;UI.toolMsg='Could not open a table.';renderUI();return}
+  UI.dropped=gid;
+  nbSend('nb:publish',{name:'Pong',data:{kind:'pong-table',gid,host:S.our}});
+}
+function tableFrom(d){
+  if(!d||typeof d!=='object')return null;
+  if(d.kind!=null&&d.kind!=='pong-table')return null;
+  const gid=String(d.gid||''),host=String(d.host||'');
+  return /^[a-z0-9-]{1,32}$/.test(gid)&&SHIP_RE.test(host)?{gid,host}:null;
+}
+function boot(ctx){
+  if(UI.view!=='boot')return;
+  const mode=ctx&&ctx.mode;
+  if(mode==='private-tool')UI.view='tool';
+  else if(mode==='note-artifact'){const t=tableFrom(ctx.artifact&&ctx.artifact.data);UI.view=t?'table':'bad';UI.table=t}
+  else{
+    const q=new URLSearchParams(location.search);
+    const t=tableFrom({gid:q.get('gid'),host:q.get('host')})||tableFrom(ctx&&ctx.context);
+    UI.view=t?'table':'lobby';UI.table=t;
+  }
+  document.body.dataset.view=UI.view;
+  if(UI.view==='tool')nbSend('nb:resize',{width:400,height:200});   // Noltbook's 42px header comes out of this
+  else if(mode==='note-artifact')nbSend('nb:resize',{height:480});
+  fitCanvas();renderUI();connect();
+}
+addEventListener('resize',fitCanvas);
+fitCanvas();requestAnimationFrame(frame);
+if(framed){
+  window.parent.postMessage({source:'noltbook-plugin',protocol:1,type:'nb:ready'},'*');
+  setTimeout(()=>{if(UI.view==='boot')boot(null)},1500);
+}else boot(null);
+</script>
+</body>
+</html>

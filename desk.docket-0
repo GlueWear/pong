@@ -2,7 +2,7 @@
   title+'Pong'
   info+'Ship-vs-ship Pong. First to 11. Plays inside Noltbook notes.'
   color+0x11.1111
-  version+[0 1 0]
+  version+[0 2 1]
   website+''
   license+'MIT'
   site+/apps/pong

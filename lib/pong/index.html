@@ -29,8 +29,9 @@ input:focus{outline:none;border-color:var(--fg)}
 .card p{margin:0}
 .row{display:flex;gap:8px;align-items:center}
 .list{display:flex;flex-direction:column;gap:6px}
-.item{display:flex;gap:6px;align-items:center;border:1px solid var(--line);padding:6px 8px}
+.item{display:flex;gap:6px;align-items:center;border:1px solid var(--line);padding:6px 8px;min-height:36px}
 .item .who{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.item .lbl{color:var(--dim);width:6.5em;flex:none}
 .dim{color:var(--dim)}
 .err{color:var(--err)}
 .msg{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);display:flex;flex-direction:column;align-items:center;gap:10px;text-align:center;pointer-events:none;padding:14px 20px;background:rgba(0,0,0,.65);max-width:calc(100% - 32px)}
@@ -59,24 +60,38 @@ body[data-view=tool] .card{border:0;padding:0;width:100%;gap:12px}
 </div>
 <script>
 'use strict';
-// %pong frontend. The agent seats two ships and relays opaque messages between
-// them; everything about the game itself happens here.
+// %pong frontend.
 //
-// Netcode in one paragraph: host is the left paddle, guest the right. Each side
-// is the authority for hits and misses on ITS OWN paddle, so what you see on
-// your paddle is what counts. Between those events the ball moves in straight
-// lines, so both sides simulate it; the far side's outcome is predicted and then
-// corrected when the owner's verdict ('b' or 'pt') arrives. Remote events are
-// fast-forwarded by half the measured round trip. Paddles go out at ~16 Hz.
+// A table lives on the ship that opened it; that ship's agent decides who holds
+// which paddle (first come, first served). Everything about the game happens in
+// the browsers:
+//
+// - The two players' pages connect directly over a WebRTC data channel. Their
+//   ships only carry the handshake, and carry the game too if WebRTC can't
+//   connect. The path is chosen when a match starts, so a match never mixes the
+//   two and messages can't overtake each other.
+// - Each side is the authority for hits and misses on ITS OWN paddle. Between
+//   those events the ball moves in straight lines, so both sides simulate it;
+//   the far side's outcome is predicted, then corrected by the owner's verdict
+//   ('b' or 'pt'). Remote events are fast-forwarded by half the round trip.
+// - Watchers connect over WebRTC to one player, who streams a snapshot, then
+//   paddles 5x a second plus every ball and point event. No ship involved.
 
-// ---------- field (logical units; both ships must agree) ----------
+// ---------- field (logical units; everyone must agree) ----------
 const W=800,H=500,BALL=12,PW=12,PH=80,PX=24;
 const LFACE=PX+PW,RFACE=W-PX-PW;                // the faces the ball strikes
 const LEFT=0,RIGHT=1;
 const SPEED0=420,SPEEDUP=1.05,SPEEDMAX=980,MAXANG=Math.PI*0.3;
 const CPU_SPEED=320,CPU_ERR=0.65,CPU_REACT=0.4;   // tuned so a 90% returner wins ~58% of points
 const STEP=1/240,WIN=11;
-const SERVE_MS=1000,COUNT_MS=3000,PADDLE_MS=60,PING_MS=2000,HI_MS=1000,STALL_MS=5000;
+const SERVE_MS=1000,COUNT_MS=3000,PING_MS=2000,HI_MS=1000,STALL_MS=5000;
+const PADDLE_RELAY_MS=60,PADDLE_RTC_MS=33;       // ship path is dearer, so sparser
+const RTC_WAIT=4000,RTC_TIMEOUT=8000,WATCH_MS=200,WATCH_TRY_MS=6000,MAX_WATCHERS=8;
+const ICE=[{urls:['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302']}];
+// Seats: a seated page tells the host it's still here every HEARTBEAT_MS (the host
+// frees a seat after 90s of silence), and gives the paddle up itself after IDLE_MS
+// with no mouse or keyboard in this frame. let, so they can be tuned from the console.
+let IDLE_MS=120000,IDLE_WARN_MS=20000,HEARTBEAT_MS=30000;
 const SHIP_RE=/^~[a-z]{3}(?:[a-z]{3})?(?:-[a-z]{6})*(?:--[a-z]{6}(?:-[a-z]{6})*)?$/;
 
 const $=id=>document.getElementById(id);
@@ -170,21 +185,23 @@ function scheduleAck(){if(Chan.ackTimer)return;Chan.ackTimer=setTimeout(()=>{Cha
 function poke(json){return new Promise(res=>{const id=++Chan.id;Chan.wait.set(id,res);enqueue({id,action:'poke',ship:Chan.ship,app:'pong',mark:'pong-action',json})})}
 function pokeQuiet(json,tag){enqueue({id:++Chan.id,action:'poke',ship:Chan.ship,app:'pong',mark:'pong-action',json},tag)}
 
-// ---------- lobby state (mirrors the agent) ----------
-const S={ready:false,our:null,games:{},notes:{},error:null};
-const UI={view:'boot',table:null,focus:null,follow:null,err:'',busy:false,toolMsg:'',dropped:null};
+// ---------- tables (mirrors the agent) ----------
+const S={ready:false,our:null,tables:{},invites:{},notes:{},gone:{},error:null};
+const UI={view:'boot',table:null,fromLobby:false,watch:false,err:'',busy:false,toolMsg:'',dropped:null};
 function onFact(j){
   if(!j||typeof j!=='object')return;
-  if(j.relay){let m=null;try{m=JSON.parse(j.relay.body)}catch(e){}if(m&&typeof m==='object')onRelay(j.relay.gid,m);return}
-  if(j.games){S.our=j.our;S.games={};for(const g of j.games)S.games[g.gid]=g;S.ready=true;S.error=null}
-  if(j.game){
-    const prev=S.games[j.game.gid];S.games[j.game.gid]=j.game;
-    // open a game when it goes live, but only if this page asked for it
-    if(j.game.status==='live'&&(!prev||prev.status!=='live')&&UI.view==='lobby'&&UI.follow===j.game.gid&&!isCpu()){UI.focus=j.game.gid;UI.follow=null}
+  if(j.relay){let m=null;try{m=JSON.parse(j.relay.body)}catch(e){}if(m&&typeof m==='object')onRelay(j.relay.gid,j.relay.from,m);return}
+  if(j.tables){
+    S.our=j.our;S.tables={};S.invites={};
+    for(const t of j.tables)S.tables[t.gid]=t;
+    for(const i of j.invites||[])S.invites[i.gid]=i.host;
+    S.ready=true;S.error=null;follow();
   }
-  if(j.gone){delete S.games[j.gone];delete S.notes[j.gone]}
+  if(j.table){S.tables[j.table.gid]=j.table;delete S.gone[j.table.gid]}
+  if(j.gone){delete S.tables[j.gone];delete S.invites[j.gone];S.gone[j.gone]=true}
+  if(j.invite)S.invites[j.invite.gid]=j.invite.host;
   if(j.note)S.notes[j.note.gid]=j.note.text;
-  syncAttach();renderUI();
+  syncSession();renderUI();
 }
 async function act(json,failText){
   const err=await poke(json);
@@ -196,92 +213,307 @@ async function act(json,failText){
   }
   return !err;
 }
-function leave(gid){
-  if(Net&&Net.gid===gid)detach();
-  if(UI.focus===gid)UI.focus=null;
-  act({leave:{gid}});renderUI();
+const curT=()=>UI.table&&S.tables[UI.table.gid];
+const sideOf=(t,ship)=>!t?null:t.left===ship?LEFT:t.right===ship?RIGHT:null;
+function follow(){if(UI.table&&S.ready)pokeQuiet({follow:{gid:UI.table.gid,host:UI.table.host}})}
+let lastInput=performance.now(),hbAt=0,refollowAt=0;
+for(const ev of ['pointermove','pointerdown','keydown','wheel','touchstart'])addEventListener(ev,()=>{lastInput=performance.now()},{passive:true,capture:true});
+function idleLeft(){const t=curT();return t&&sideOf(t,S.our)!=null?IDLE_MS-(performance.now()-lastInput):null}
+const idleWarn=left=>'Still there? Your paddle frees in '+Math.max(1,Math.ceil(left/1000))+'s — move your mouse here.';
+setInterval(()=>{
+  if(!S.ready||!UI.table)return;
+  const now=performance.now(),t=curT();
+  if(!t){
+    // closed under an older version, the host can't tell us it reopened: look again now and then
+    if(S.gone[UI.table.gid]&&UI.table.host!==S.our&&now-refollowAt>30000){refollowAt=now;follow()}
+    return;
+  }
+  if(sideOf(t,S.our)==null)return;
+  const left=IDLE_MS-(now-lastInput);
+  if(left<=0){
+    lastInput=now;
+    S.notes[t.gid]='You were idle for '+Math.round(IDLE_MS/60000)+' minutes, so your paddle was freed.';
+    standUp();renderUI();return;
+  }
+  if(left<IDLE_WARN_MS)renderUI();                   // the card shows the countdown
+  if(now-hbAt>=HEARTBEAT_MS){hbAt=now;pokeQuiet({here:{gid:t.gid,host:t.host}})}
+},1000);
+function sit(side){
+  const t=UI.table;UI.err='';delete S.notes[t.gid];
+  act({sit:{gid:t.gid,host:t.host,side:side===LEFT?'l':'r'}},'Could not take that paddle.');renderUI();
 }
-function join(gid,host){UI.follow=gid;UI.err='';act({join:{gid,host}},'Could not ask for a seat.')}
+function standUp(){const t=UI.table;UI.watch=false;act({stand:{gid:t.gid,host:t.host}})}
+function reportScore(){
+  if(Net&&Net.role==='player')pokeQuiet({score:{gid:Net.gid,host:UI.table.host,l:G.score[0],r:G.score[1]}});
+}
+function openTable(gid,host){UI.table={gid,host};UI.fromLobby=true;UI.watch=false;UI.err='';follow();syncSession();renderUI()}
+function backToLobby(){UI.table=null;UI.watch=false;UI.err='';syncSession();renderUI()}
 
-// ---------- attaching to a live game ----------
+// ---------- sessions: playing or watching the open table ----------
 let Net=null,G=null;
 const isCpu=()=>!!G&&G.mode==='cpu';
-function wantedGid(){
-  if(isCpu())return null;
-  const gid=UI.view==='table'?UI.table.gid:UI.view==='lobby'?UI.focus:null;
-  const g=gid&&S.games[gid];
-  return g&&g.status==='live'?gid:null;
+function wantSession(){
+  if(isCpu()||!UI.table||!S.ready)return null;
+  const t=curT();if(!t||!t.left||!t.right)return null;
+  const me=sideOf(t,S.our),key=t.gid+':'+t.left+':'+t.right;
+  if(me!=null)return{role:'player',gid:t.gid,me,them:me===LEFT?t.right:t.left,key:'p:'+key};
+  if(UI.watch)return{role:'watch',gid:t.gid,players:[t.left,t.right],key:'w:'+key};
+  return null;
 }
-function syncAttach(){
-  const want=wantedGid();
-  if(Net&&Net.gid!==want)detach();
-  if(want&&!Net)attach(want);
+function syncSession(){
+  const w=wantSession();
+  if(Net&&(!w||w.key!==Net.key))endSession();
+  if(w&&!Net)(w.role==='player'?startPlayer:startWatch)(w);
 }
-function attach(gid){
-  const g=S.games[gid],host=g.host===S.our;
-  Net={gid,host,them:host?g.guest:g.host,sid:rid(10),peer:null,heard:false,linked:false,rtt:150,lastRx:0,lastPy:null,lastPAt:0,hiAt:0,pingAt:0};
-  G=newGame('net',host?LEFT:RIGHT);
+function endSession(){
+  if(!Net)return;
+  if(Net.rtc)rtcClose(Net.rtc,true);
+  if(Net.watchers)for(const r of Net.watchers.values())rtcClose(r,true);
+  Net=null;if(G&&G.mode!=='cpu')G=null;
+}
+function relayTo(ship,m,tag){if(Net)pokeQuiet({relay:{gid:Net.gid,to:ship,body:JSON.stringify(m)}},tag?Net.gid+':'+ship+':'+tag:null)}
+const lat=()=>Net?Math.min(250,Math.max(0,Net.rtt/2))/1000:0;
+function onRelay(gid,from,m){
+  if(!Net||Net.gid!==gid)return;
+  if(Net.role==='watch'){if(m.t==='rtc'&&m.to===Net.sid)onWatchSignal(from,m);return}
+  if(m.t==='rtc'){
+    if(m.w)onWatcherSignal(from,m);
+    else if(from===Net.them)onPlayerSignal(m);
+    return;
+  }
+  if(from===Net.them)onPeer(m);
+}
+
+// ---------- WebRTC ----------
+function rtcOpen(o){
+  const r={ship:o.ship,peerSid:o.peerSid||null,watch:!!o.watch,pc:null,dc:null,open:false,closed:false,sent:false,out:[],ice:[],o};
+  try{r.pc=new RTCPeerConnection({iceServers:ICE})}catch(e){r.closed=true;return r}
+  const pc=r.pc;
+  pc.onicecandidate=e=>{if(e.candidate)rtcSig(r,{k:'ice',c:e.candidate.toJSON()})};
+  pc.onconnectionstatechange=()=>{if(pc.connectionState==='failed')rtcClose(r)};
+  if(o.offer){
+    rtcBind(r,pc.createDataChannel('pong'));
+    pc.createOffer().then(d=>pc.setLocalDescription(d)).then(()=>rtcSig(r,{k:'offer',sdp:pc.localDescription.sdp})).catch(()=>rtcClose(r));
+  }else pc.ondatachannel=e=>rtcBind(r,e.channel);
+  return r;
+}
+function rtcBind(r,dc){
+  r.dc=dc;
+  dc.onopen=()=>{if(r.closed)return;r.open=true;if(r.o.onopen)r.o.onopen(r)};
+  dc.onclose=()=>rtcClose(r);
+  dc.onmessage=e=>{let m;try{m=JSON.parse(e.data)}catch(x){return}if(m&&typeof m==='object'&&!r.closed)r.o.onmsg(m,r)};
+}
+// candidates wait until our offer/answer has gone out, or they'd reach a peer
+// that has no connection to add them to yet
+function rtcSig(r,s){
+  if(r.closed||!Net)return;
+  if(s.k==='ice'&&!r.sent){r.out.push(s);return}
+  relayTo(r.ship,Object.assign({t:'rtc',w:r.watch?1:0,from:Net.sid,to:r.peerSid},s));
+  if(s.k!=='ice'){r.sent=true;for(const x of r.out.splice(0))rtcSig(r,x)}
+}
+async function rtcIncoming(r,s){
+  const pc=r.pc;if(!pc||r.closed)return;
+  try{
+    if(s.k==='offer'){
+      await pc.setRemoteDescription({type:'offer',sdp:s.sdp});
+      await pc.setLocalDescription(await pc.createAnswer());
+      rtcSig(r,{k:'answer',sdp:pc.localDescription.sdp});
+      for(const c of r.ice.splice(0))await pc.addIceCandidate(c);
+    }else if(s.k==='answer'){
+      if(pc.signalingState!=='have-local-offer')return;
+      await pc.setRemoteDescription({type:'answer',sdp:s.sdp});
+      for(const c of r.ice.splice(0))await pc.addIceCandidate(c);
+    }else if(s.k==='ice'&&s.c){
+      if(pc.remoteDescription)await pc.addIceCandidate(s.c);else r.ice.push(s.c);
+    }
+  }catch(e){console.warn('[pong] webrtc',e);rtcClose(r)}
+}
+function rtcSend(r,m){
+  if(!r||!r.open||!r.dc||r.dc.readyState!=='open')return false;
+  try{r.dc.send(JSON.stringify(m));return true}catch(e){return false}
+}
+function rtcClose(r,quiet){
+  if(!r||r.closed)return;
+  r.closed=true;const was=r.open;r.open=false;
+  try{if(r.dc)r.dc.close()}catch(e){}
+  try{if(r.pc)r.pc.close()}catch(e){}
+  if(!quiet&&r.o.onclose)r.o.onclose(r,was);
+}
+
+// ---------- player session ----------
+function startPlayer(w){
+  Net={key:w.key,role:'player',gid:w.gid,me:w.me,lead:w.me===LEFT,them:w.them,sid:rid(10),
+    peer:null,heard:false,linked:false,rtt:150,lastRx:0,lastPy:null,lastPAt:0,hiAt:0,pingAt:0,
+    rtc:null,rtcSince:0,startAt:0,watchers:new Map(),wAt:0};
+  G=newGame('net',w.me);
   unlockAudio();sendHi();
 }
-function detach(){Net=null;if(G&&G.mode==='net')G=null}
-function netSend(m,tag){if(Net)pokeQuiet({relay:{gid:Net.gid,body:JSON.stringify(m)}},tag?Net.gid+':'+tag:null)}
-function sendHi(){Net.hiAt=performance.now();netSend({t:'hi',sid:Net.sid,seen:Net.peer})}
-const lat=()=>Net?Math.min(250,Math.max(0,Net.rtt/2))/1000:0;
-function netTick(now){
-  if(!Net)return;
-  if(!Net.linked&&now-Net.hiAt>HI_MS)sendHi();
-  if(!Net.linked)return;
-  if(now-Net.pingAt>PING_MS){Net.pingAt=now;netSend({t:'ping',ts:now})}
-  const y=Math.round(G.pad[G.me]*10)/10;
-  if(y!==Net.lastPy&&now-Net.lastPAt>=PADDLE_MS){Net.lastPy=y;Net.lastPAt=now;netSend({t:'p',y},'p')}
-}
-function onRelay(gid,m){
-  if(!Net||Net.gid!==gid||!G)return;
-  const now=performance.now();Net.lastRx=now;
-  switch(m.t){
-    case 'hi':onHi(m);break;
-    case 'ping':netSend({t:'pong',ts:m.ts});break;
-    case 'pong':{const s=now-Number(m.ts);if(s>=0&&s<5000)Net.rtt=Net.rtt*0.7+s*0.3;break}
-    case 'p':if(Number.isFinite(m.y))G.pad[1-G.me]=clampPad(m.y);break;
-    case 'go':if(!Net.host&&Number.isFinite(m.m)){Net.linked=true;startMatch(m.m)}break;
-    case 'b':if(m.m===G.m)adoptBall(m);break;
-    case 'pt':if(m.m===G.m)adoptPoint(m);break;
-    case 'again':if(m.m===G.m){G.peerAgain=true;maybeRematch()}break;
-  }
-}
-// Handshake: each page has a session id. Linked once we know the other page's id
-// AND it has echoed ours. A new id from the other side means it reloaded: reset.
+function sendHi(){Net.hiAt=performance.now();relayTo(Net.them,{t:'hi',sid:Net.sid,seen:Net.peer})}
+// Handshake: linked once we know the other page's id AND it has echoed ours.
+// A new id from the other side means it reloaded: start over together.
 function onHi(m){
   if(typeof m.sid!=='string')return;
   if(m.sid!==Net.peer){
-    const me=G.me;
-    Net.peer=m.sid;Net.heard=false;Net.linked=false;
-    G=newGame('net',me);
+    Net.peer=m.sid;Net.heard=false;Net.linked=false;Net.startAt=0;
+    if(Net.rtc){rtcClose(Net.rtc,true);Net.rtc=null}
+    G=newGame('net',Net.me);
     sendHi();
+    if(Net.lead)playerRtc(true);
   }else if(m.seen!==Net.sid&&Net.linked)sendHi();
   if(m.seen===Net.sid)Net.heard=true;
   if(!Net.linked&&Net.peer&&Net.heard){
     Net.linked=true;Net.lastRx=performance.now();Net.pingAt=0;
-    if(Net.host)hostStart();
+    Net.startAt=performance.now()+(Net.rtc?RTC_WAIT:0);
   }
 }
-function hostStart(){const m=1+Math.floor(Math.random()*1e9);netSend({t:'go',m});startMatch(m)}
+function playerRtc(offer){
+  Net.rtcSince=performance.now();
+  Net.rtc=rtcOpen({ship:Net.them,peerSid:Net.peer,offer,
+    onmsg:m=>onPeer(m),
+    onclose:r=>{if(Net&&Net.rtc===r){Net.rtc=null;rtcLost()}}});
+}
+function onPlayerSignal(m){
+  if(m.to!==Net.sid||m.from!==Net.peer)return;
+  if(m.k==='offer'&&!Net.lead){if(Net.rtc)rtcClose(Net.rtc,true);playerRtc(false)}
+  if(Net.rtc)rtcIncoming(Net.rtc,m);
+}
+// match messages take the path the match started on
+function sendPeer(m,tag){
+  if(!Net)return;
+  if(G&&G.via==='rtc'){if(rtcSend(Net.rtc,m))return;rtcLost()}
+  relayTo(Net.them,m,tag);
+}
+function rtcLost(){
+  if(!G||G.via!=='rtc')return;
+  G.via='relay';
+  // anything in flight on the dead channel is gone; the lead restates the match
+  if(Net&&Net.lead&&G.m)relayTo(Net.them,Object.assign({t:'sync'},snapshot()));
+}
+function emit(m){sendPeer(m);fanOut(m,0)}                  // an event we author
+function hostStart(){
+  const m=1+Math.floor(Math.random()*1e9),via=Net.rtc&&Net.rtc.open?'rtc':'relay',go={t:'go',m,via};
+  if(via==='rtc')rtcSend(Net.rtc,go);else relayTo(Net.them,go);
+  startMatch(m,via);fanOut({t:'go',m},0);reportScore();
+}
+function onPeer(m){
+  if(!G||!Net)return;
+  const now=performance.now();Net.lastRx=now;
+  switch(m.t){
+    case 'hi':onHi(m);break;
+    case 'ping':sendPeer({t:'pong',ts:m.ts});break;
+    case 'pong':{const s=now-Number(m.ts);if(s>=0&&s<5000)Net.rtt=Net.rtt*0.7+s*0.3;break}
+    case 'p':if(Number.isFinite(m.y))G.pad[1-G.me]=clampPad(m.y);break;
+    case 'go':if(!Net.lead&&Number.isFinite(m.m)){Net.linked=true;startMatch(m.m,m.via==='rtc'?'rtc':'relay');fanOut({t:'go',m:m.m},lat())}break;
+    case 'b':if(m.m===G.m&&adoptBall(m,lat()))fanOut(m,lat());break;
+    case 'pt':if(m.m===G.m&&adoptPoint(m))fanOut(m,lat());break;
+    case 'again':if(m.m===G.m){G.peerAgain=true;maybeRematch()}break;
+    case 'sync':if(!Net.lead&&m.m===G.m){G.via='relay';adoptSnap(m,lat())}break;
+  }
+}
+// watchers ask any player; each player serves its own
+function onWatcherSignal(from,m){
+  if(!G||typeof m.from!=='string')return;
+  let r=Net.watchers.get(m.from);
+  if(!r&&m.k==='offer'){
+    if(Net.watchers.size>=MAX_WATCHERS)return;
+    r=rtcOpen({ship:from,peerSid:m.from,offer:false,watch:true,
+      onopen:r=>rtcSend(r,Object.assign({t:'snap'},snapshot())),
+      onmsg:(x,r)=>{if(x.t==='ping')rtcSend(r,{t:'pong',ts:x.ts})},
+      onclose:r=>{if(Net&&Net.watchers)Net.watchers.delete(r.peerSid)}});
+    Net.watchers.set(m.from,r);
+  }
+  if(r&&r.ship===from)rtcIncoming(r,m);
+}
+function fanOut(m,age){
+  if(!Net||!Net.watchers||!Net.watchers.size)return;
+  const x=Object.assign({},m,{age:Math.round(age*1000)});
+  for(const r of Net.watchers.values())rtcSend(r,x);
+}
+function snapshot(){
+  const b=G.ball;
+  return{m:G.m,k:G.k,phase:G.phase,s:G.score.slice(),pads:[G.pad[0],G.pad[1]],
+    count:Math.max(0,Math.round(G.countEnd-performance.now())),serveBy:G.serveBy,
+    ball:{x:b.x,y:b.y,vx:b.vx,vy:b.vy,live:b.live&&!b.frozen}};
+}
+function adoptSnap(m,ff){
+  if(!Number.isFinite(m.m))return;
+  const b=G.ball,now=performance.now();
+  G.m=m.m;G.k=m.k|0;G.score=[m.s[0]|0,m.s[1]|0];G.phase=m.phase;G.serveBy=m.serveBy;
+  G.countEnd=now+(m.count|0)-ff*1000;G.serveAt=now+SERVE_MS;
+  if(Array.isArray(m.pads)&&G.mode==='watch'){G.pad=[clampPad(+m.pads[0]||H/2),clampPad(+m.pads[1]||H/2)];G.show=G.pad.slice()}
+  const s=m.ball||{};
+  if(s.live&&[s.x,s.y,s.vx,s.vy].every(Number.isFinite)){
+    b.x=s.x;b.y=s.y;b.vx=s.vx;b.vy=s.vy;b.live=true;b.spec=false;b.frozen=false;fastForward(ff);
+  }else b.live=false;
+  G.corr={x:0,y:0};
+}
+
+// ---------- watcher session ----------
+function startWatch(w){
+  Net={key:w.key,role:'watch',gid:w.gid,players:w.players,tries:0,sid:rid(10),
+    rtc:null,rtcSince:0,rtt:150,lastRx:0,linked:false,pingAt:0};
+  G=newGame('watch',LEFT);
+  watchTry();
+}
+function watchTry(){
+  const ship=Net.players[Net.tries++%2];
+  if(Net.rtc)rtcClose(Net.rtc,true);
+  Net.linked=false;Net.rtcSince=performance.now();
+  Net.rtc=rtcOpen({ship,offer:true,watch:true,
+    onopen:()=>{Net.linked=true;Net.lastRx=performance.now();Net.pingAt=0},
+    onmsg:m=>onWatchMsg(m),
+    onclose:r=>{if(Net&&Net.rtc===r){Net.rtc=null;Net.linked=false;Net.rtcSince=0}}});
+}
+function onWatchSignal(from,m){
+  const r=Net.rtc;if(!r||r.ship!==from)return;
+  if(!r.peerSid&&m.k==='answer')r.peerSid=m.from;
+  if(m.from===r.peerSid)rtcIncoming(r,m);
+}
+function onWatchMsg(m){
+  const now=performance.now(),ff=(Number(m.age)||0)/1000+lat();Net.lastRx=now;
+  switch(m.t){
+    case 'snap':G=newGame('watch',LEFT);adoptSnap(m,ff);break;
+    case 'w':if(m.m===G.m&&Array.isArray(m.pads)){G.pad[0]=clampPad(+m.pads[0]||H/2);G.pad[1]=clampPad(+m.pads[1]||H/2)}break;
+    case 'go':if(Number.isFinite(m.m)){startMatch(m.m,'rtc');G.countEnd-=ff*1000}break;
+    case 'b':if(m.m===G.m)adoptBall(m,ff);break;
+    case 'pt':if(m.m===G.m)adoptPoint(m);break;
+    case 'pong':{const s=now-Number(m.ts);if(s>=0&&s<5000)Net.rtt=Net.rtt*0.7+s*0.3;break}
+  }
+}
+
+function netTick(now){
+  if(!Net)return;
+  if(Net.role==='watch'){
+    if(!Net.linked&&now-Net.rtcSince>WATCH_TRY_MS)watchTry();
+    if(Net.linked&&now-Net.pingAt>PING_MS){Net.pingAt=now;rtcSend(Net.rtc,{t:'ping',ts:now})}
+    return;
+  }
+  if(!Net.linked&&now-Net.hiAt>HI_MS)sendHi();
+  if(Net.rtc&&!Net.rtc.open&&now-Net.rtcSince>RTC_TIMEOUT)rtcClose(Net.rtc);
+  if(!Net.linked)return;
+  if(Net.lead&&!G.m&&Net.startAt&&(now>=Net.startAt||(Net.rtc&&Net.rtc.open)))hostStart();
+  if(!G.m)return;
+  if(now-Net.pingAt>PING_MS){Net.pingAt=now;sendPeer({t:'ping',ts:now})}
+  const y=Math.round(G.pad[G.me]*10)/10,gap=G.via==='rtc'?PADDLE_RTC_MS:PADDLE_RELAY_MS;
+  if(y!==Net.lastPy&&now-Net.lastPAt>=gap){Net.lastPy=y;Net.lastPAt=now;sendPeer({t:'p',y},'p')}
+  if(Net.watchers.size&&now-Net.wAt>=WATCH_MS){Net.wAt=now;fanOut({t:'w',m:G.m,pads:[Math.round(G.pad[0]),Math.round(G.pad[1])]},0)}
+}
 
 // ---------- match ----------
 function newGame(mode,me){
-  return{mode,me,m:0,pad:[H/2,H/2],show:[H/2,H/2],score:[0,0],
+  return{mode,me,m:0,via:null,pad:[H/2,H/2],show:[H/2,H/2],score:[0,0],
     ball:{x:W/2-BALL/2,y:H/2-BALL/2,vx:0,vy:0,live:false,spec:false,frozen:false},
     k:0,phase:'wait',countEnd:0,serveAt:0,serveBy:null,serveDir:0,
     corr:{x:0,y:0},predHit:false,wantAgain:false,peerAgain:false,cpuErr:0,acc:0};
 }
-const mine=side=>G.mode==='cpu'||side===G.me;
-function startMatch(m){
+const mine=side=>G.mode==='cpu'||(G.mode==='net'&&side===G.me);
+function startMatch(m,via){
   const keep=G.pad.slice();
-  G=newGame(G.mode,G.me);G.pad=keep;G.show=keep.slice();G.m=m;
+  G=newGame(G.mode,G.me);G.pad=keep;G.show=keep.slice();G.m=m;G.via=via||null;
   const now=performance.now();
   G.phase='count';
-  G.countEnd=now+COUNT_MS-(Net&&!Net.host?lat()*1000:0);
-  G.serveBy=LEFT;G.serveAt=now+COUNT_MS;           // host (or you, vs CPU) serves first
+  G.countEnd=now+COUNT_MS-(Net&&Net.role==='player'&&!Net.lead?lat()*1000:0);
+  G.serveBy=LEFT;G.serveAt=now+COUNT_MS;          // the left paddle serves first
   unlockAudio();
 }
 function serve(){
@@ -290,7 +522,7 @@ function serve(){
   b.vx=dir*SPEED0*Math.cos(a);b.vy=SPEED0*Math.sin(a);
   b.live=true;b.spec=false;b.frozen=false;G.corr={x:0,y:0};G.predHit=false;
   G.k++;G.phase='play';G.serveBy=null;
-  netSend({t:'b',m:G.m,k:G.k,x:b.x,y:b.y,vx:b.vx,vy:b.vy,e:'serve'});
+  emit({t:'b',m:G.m,k:G.k,x:b.x,y:b.y,vx:b.vx,vy:b.vy,e:'serve'});
 }
 function simStep(dt){
   const b=G.ball;if(!b.live||b.frozen)return;
@@ -308,7 +540,7 @@ function cross(side){
   if(mine(side)&&!b.spec){
     if(!hit)return;                                 // a miss is settled at the goal line
     bounce(side);G.k++;sfx.paddle();
-    netSend({t:'b',m:G.m,k:G.k,x:b.x,y:b.y,vx:b.vx,vy:b.vy,e:'hit'});
+    emit({t:'b',m:G.m,k:G.k,x:b.x,y:b.y,vx:b.vx,vy:b.vy,e:'hit'});
   }else{
     // not ours to call: guess from their last known paddle, the owner corrects us
     b.spec=true;
@@ -329,8 +561,8 @@ function goal(side){
 }
 function concede(side){
   G.ball.live=false;G.score[1-side]++;G.k++;sfx.score();
-  netSend({t:'pt',m:G.m,k:G.k,s:G.score.slice()});
-  afterPoint(side);
+  emit({t:'pt',m:G.m,k:G.k,s:G.score.slice(),c:side});
+  afterPoint(side);reportScore();
 }
 function afterPoint(conceder){
   G.predHit=false;
@@ -344,33 +576,35 @@ function fastForward(sec){
     if(b.y<0){b.y=-b.y;b.vy=Math.abs(b.vy)}else if(b.y>H-BALL){b.y=2*(H-BALL)-b.y;b.vy=-Math.abs(b.vy)}
   }
 }
-function adoptBall(m){
-  if(!(m.k>G.k)||![m.x,m.y,m.vx,m.vy].every(Number.isFinite))return;
+function adoptBall(m,ff){
+  if(!(m.k>G.k)||![m.x,m.y,m.vx,m.vy].every(Number.isFinite))return false;
   const b=G.ball,was=(b.live&&!b.frozen)?{x:b.x,y:b.y}:null;
   G.k=m.k;
   b.x=m.x;b.y=m.y;b.vx=m.vx;b.vy=m.vy;b.live=true;b.spec=false;b.frozen=false;
-  fastForward(lat());
+  fastForward(Math.min(0.5,ff));
   // small corrections glide; big ones (a wrong guess) snap
   if(was&&Math.hypot(was.x-b.x,was.y-b.y)<80){G.corr.x+=was.x-b.x;G.corr.y+=was.y-b.y}else G.corr={x:0,y:0};
   if(m.e==='hit'&&!G.predHit)sfx.paddle();
   G.predHit=false;G.phase='play';G.serveBy=null;
+  return true;
 }
 function adoptPoint(m){
-  if(!(m.k>G.k)||!Array.isArray(m.s)||m.s.length!==2)return;
+  if(!(m.k>G.k)||!Array.isArray(m.s)||m.s.length!==2)return false;
   G.k=m.k;G.score=[m.s[0]|0,m.s[1]|0];G.ball.live=false;G.corr={x:0,y:0};sfx.score();
-  afterPoint(1-G.me);
+  afterPoint(m.c===LEFT||m.c===RIGHT?m.c:1-G.me);
+  return true;
 }
 function askRematch(){
   if(isCpu()){startMatch(0);renderUI();return}
-  G.wantAgain=true;netSend({t:'again',m:G.m});maybeRematch();
+  G.wantAgain=true;sendPeer({t:'again',m:G.m});maybeRematch();
 }
-function maybeRematch(){if(Net&&Net.host&&G.phase==='over'&&G.wantAgain&&G.peerAgain)hostStart()}
+function maybeRematch(){if(Net&&Net.lead&&G.phase==='over'&&G.wantAgain&&G.peerAgain)hostStart()}
 function cpuTick(dt){
   const b=G.ball,target=(b.live&&b.vx>0&&b.x>W*CPU_REACT)?b.y+BALL/2+G.cpuErr:H/2,cur=G.pad[RIGHT],step=CPU_SPEED*dt;
   G.pad[RIGHT]=clampPad(cur+Math.max(-step,Math.min(step,target-cur)));
 }
 function startCpu(){
-  UI.focus=null;detach();
+  endSession();UI.table=null;
   G=newGame('cpu',LEFT);startMatch(0);renderUI();
 }
 function quitCpu(){G=null;renderUI()}
@@ -403,17 +637,24 @@ function drawScore(n,x,y,alignRight){
   }
 }
 const IDLE=newGame('idle',LEFT);
+function seatNames(){
+  if(isCpu())return['you','cpu'];
+  const t=curT();if(!t)return null;
+  const n=s=>!s?'':s===S.our?'you':s;
+  return[n(t.left),n(t.right)];
+}
 function draw(){
-  const s=cv.width/W,g=G||IDLE,b=g.ball;
+  const s=cv.width/W,g=G||IDLE,b=g.ball,t=!G&&curT();
   ctx.setTransform(s,0,0,s,0,0);
   ctx.fillStyle='#000';ctx.fillRect(0,0,W,H);
   ctx.fillStyle='#555';for(let y=6;y<H;y+=26)ctx.fillRect(W/2-2,y,4,14);
   ctx.fillStyle='#f2f2f2';
-  drawScore(g.score[0],W/2-44,24,true);drawScore(g.score[1],W/2+44,24,false);
+  const sc=t?t.score:g.score;
+  drawScore(sc[0],W/2-44,24,true);drawScore(sc[1],W/2+44,24,false);
   ctx.fillRect(PX,Math.round(g.show[0]-PH/2),PW,PH);
   ctx.fillRect(W-PX-PW,Math.round(g.show[1]-PH/2),PW,PH);
   if(b.live&&!b.frozen)ctx.fillRect(Math.round(b.x+g.corr.x),Math.round(b.y+g.corr.y),BALL,BALL);
-  const names=!G?null:isCpu()?['you','cpu']:Net?(Net.host?['you',Net.them]:[Net.them,'you']):null;
+  const names=seatNames();
   if(names){
     ctx.font='13px ui-monospace,Menlo,monospace';ctx.textBaseline='bottom';
     ctx.fillStyle=names[0]==='you'?'#cfcfcf':'#6a6a6a';ctx.textAlign='left';ctx.fillText(names[0],PX,H-8);
@@ -424,23 +665,32 @@ function draw(){
 // ---------- overlays ----------
 function msgState(now){
   if(!G)return null;
-  const them=isCpu()?'CPU':Net?Net.them:'';
+  const il=G.mode==='net'?idleLeft():null;
+  if(il!=null&&il<IDLE_WARN_MS)return{key:'idle'+Math.ceil(il/1000),text:idleWarn(il)};
+  const watch=G.mode==='watch',names=seatNames()||['',''];
+  const them=isCpu()?'CPU':Net&&Net.role==='player'?Net.them:'';
+  if(watch&&!Net.linked)return{key:'wconn',text:'Connecting to the game…'};
   if(G.mode==='net'&&!Net.linked)return{key:'wait',text:'Waiting for '+them+' to open the game…'};
+  if(G.mode==='net'&&!G.m)return{key:'conn',text:'Connecting…'};
   if(G.phase==='count'&&now<G.countEnd){const n=Math.max(1,Math.ceil((G.countEnd-now)/1000));return{key:'c'+n,big:String(n)}}
   if(G.phase==='over'){
+    if(watch){
+      const w=G.score[0]>G.score[1]?0:1;
+      return{key:'over-w',big:(names[w]==='you'?'YOU':names[w]||'?')+' WINS',text:G.score[w]+' – '+G.score[1-w]};
+    }
     const won=G.score[G.me]>G.score[1-G.me],sc=G.score[G.me]+' – '+G.score[1-G.me];
     const big=won?'YOU WIN':isCpu()?'CPU WINS':'YOU LOSE';
     if(isCpu())return{key:'over-cpu',big,text:sc,btns:[['Play again',askRematch],['Quit',quitCpu,'ghost']]};
     const text=G.wantAgain?'Waiting for '+them+'…':G.peerAgain?them+' wants a rematch':sc;
-    return{key:'over-'+G.wantAgain+G.peerAgain,big,text,btns:[['Rematch',askRematch,'',G.wantAgain],['Leave',()=>leave(Net.gid),'ghost']]};
+    return{key:'over-'+G.wantAgain+G.peerAgain,big,text,btns:[['Rematch',askRematch,'',G.wantAgain],['Stand up',standUp,'ghost']]};
   }
-  if(Net&&now-Net.lastRx>STALL_MS)return{key:'stall',text:'Lost contact with '+them+'…'};
+  if(Net&&now-Net.lastRx>STALL_MS)return{key:'stall',text:watch?'The game feed stalled…':'Lost contact with '+them+'…'};
   return null;
 }
 let msgKey='';
 function updateMsg(now){
   const st=$('panel').hidden?msgState(now):null,key=st?st.key:'';
-  cv.style.cursor=(G&&!st&&$('panel').hidden)?'none':'default';
+  cv.style.cursor=(G&&G.mode!=='watch'&&!st&&$('panel').hidden)?'none':'default';
   if(key===msgKey)return;msgKey=key;
   const box=$('msg');box.textContent='';
   if(!st){box.hidden=true;return}
@@ -452,8 +702,12 @@ function updateMsg(now){
 function statusText(){
   if(!S.ready)return S.error?'offline':'connecting…';
   if(isCpu())return 'practice vs CPU';
-  if(Net)return (Net.host?'left':'right')+' paddle vs '+Net.them+(Net.linked?' · '+Math.round(Net.rtt)+' ms':'');
-  if(UI.view==='table')return UI.table.host===S.our?'your table':UI.table.host+'’s table';
+  if(Net&&Net.role==='player'){
+    const path=!G.m?'':G.via==='rtc'?' · direct':' · via ships';
+    return (Net.me===LEFT?'left':'right')+' paddle vs '+Net.them+(Net.linked?' · '+Math.round(Net.rtt)+' ms'+path:'');
+  }
+  if(Net&&Net.role==='watch')return 'watching'+(Net.linked?' · '+Math.round(Net.rtt)+' ms':'');
+  if(UI.table)return UI.table.host===S.our?'your table':UI.table.host+'’s table';
   return S.our||'';
 }
 
@@ -464,8 +718,13 @@ async function challenge(){
   let v=shipInput.value.trim().toLowerCase();if(v&&v[0]!=='~')v='~'+v;
   if(!SHIP_RE.test(v)){UI.err='Enter a ship, like ~sampel-palnet.';renderUI();return}
   if(v===S.our){UI.err='That’s you.';renderUI();return}
-  const gid=rid(10);UI.err='';UI.follow=gid;
-  if(await act({challenge:{gid,who:v}},'Challenge failed.'))shipInput.value='';
+  const gid=rid(10);UI.err='';
+  if(await act({challenge:{gid,who:v}},'Challenge failed.')){shipInput.value='';openTable(gid,S.our)}
+}
+function tableLabel(t){
+  const who=[t.left,t.right].map(s=>s===S.our?'you':s);
+  const seats=t.left&&t.right?who[0]+' vs '+who[1]:(who[0]||who[1]||'nobody')+' seated';
+  return (t.host===S.our?'Your table':t.host+'’s table')+' — '+seats;
 }
 function lobbyCard(){
   const c=el('div','card'),row=el('div','row');
@@ -473,53 +732,69 @@ function lobbyCard(){
   const slot=el('span');slot.dataset.slot='ship';     // the live input is moved in after placement
   row.append(slot,button('Challenge',challenge));c.append(row);
   if(UI.err)c.append(el('div','err',UI.err));
-  const games=Object.values(S.games).sort((a,b)=>b.created-a.created);
-  if(games.length){const list=el('div','list');for(const g of games)list.append(gameRow(g));c.append(el('h2',null,'GAMES'),list)}
+  const inv=Object.entries(S.invites);
+  if(inv.length){
+    const list=el('div','list');
+    for(const [gid,host] of inv){
+      const it=el('div','item'),who=el('div','who',host+' challenges you');
+      it.append(who,button('Play',()=>{openTable(gid,host);sit(RIGHT)}),button('Decline',()=>act({dismiss:{gid}}),'ghost'));
+      list.append(it);
+    }
+    c.append(el('h2',null,'CHALLENGES'),list);
+  }
+  const mine=Object.values(S.tables).filter(t=>(t.host===S.our||sideOf(t,S.our)!=null)&&!S.invites[t.gid]).sort((a,b)=>b.created-a.created);
+  if(mine.length){
+    const list=el('div','list');
+    for(const t of mine){
+      const it=el('div','item'),who=el('div','who',tableLabel(t));who.title=who.textContent;
+      it.append(who,button('Open',()=>openTable(t.gid,t.host)),
+        t.host===S.our?button('Close',()=>act({close:{gid:t.gid}}),'ghost'):button('Forget',()=>forget(t),'ghost'));
+      list.append(it);
+    }
+    c.append(el('h2',null,'TABLES'),list);
+  }
   c.append(el('h2',null,'PRACTICE'),button('Play vs CPU',startCpu));
   return c;
 }
-function gameRow(g){
-  const them=g.host===S.our?g.guest:g.host,row=el('div','item'),who=el('div','who');
-  let text,btns;
-  switch(g.status){
-    case 'open':text='Open table in a note — waiting';btns=[button('Close',()=>leave(g.gid),'ghost')];break;
-    case 'invited':text='Challenged '+them+' — waiting';btns=[button('Cancel',()=>leave(g.gid),'ghost')];break;
-    case 'incoming':text=them+' challenges you';btns=[button('Play',()=>join(g.gid,g.host)),button('Decline',()=>leave(g.gid),'ghost')];break;
-    case 'joining':text='Joining '+them+'…';btns=[button('Cancel',()=>leave(g.gid),'ghost')];break;
-    case 'live':text='vs '+them;btns=[button('Play',()=>{UI.focus=g.gid;syncAttach();renderUI()}),button('Leave',()=>leave(g.gid),'ghost')];break;
-    default:text=(them||'table')+' — '+(S.notes[g.gid]||'ended');btns=[button('Dismiss',()=>leave(g.gid),'ghost')];
-  }
-  who.textContent=text;who.title=text;row.append(who,...btns);return row;
-}
-function endedCard(g){
-  const them=g.host===S.our?g.guest:g.host,c=el('div','card');
-  c.append(el('h2',null,'GAME OVER'),para(S.notes[g.gid]||(them+' left.')),button('Back',()=>leave(g.gid)));
-  return c;
+function forget(t){if(sideOf(t,S.our)!=null)act({stand:{gid:t.gid,host:t.host}});act({dismiss:{gid:t.gid}})}
+function seatRow(t,side){
+  const who=side===LEFT?t.left:t.right,me=sideOf(t,S.our),row=el('div','item');
+  row.append(el('span','lbl',side===LEFT?'Left paddle':'Right paddle'));
+  let text=who?(who===S.our?'you':who):'open';
+  const held=side===RIGHT&&!who&&t.invite&&t.invite!==S.our;
+  if(held)text='saved for '+t.invite;
+  const w=el('span','who'+(who?'':' dim'),text);w.title=text;row.append(w);
+  if(!who&&me==null&&!held)row.append(button('Take it',()=>sit(side)));
+  return row;
 }
 function tableCard(){
-  const t=UI.table,g=S.games[t.gid],c=el('div','card'),note=g&&S.notes[g.gid];
+  const g=UI.table,t=curT(),c=el('div','card'),note=S.notes[g.gid];
   c.append(el('h2',null,'PONG TABLE'));
-  if(t.host===S.our){
-    if(!g){c.append(para('This table is closed.'),button('Reopen table',()=>act({host:{gid:t.gid}},'Could not reopen.')))}
-    else if(g.status==='open'){
-      c.append(para('Your table is open. Anyone in this note can take the other paddle. First to 11.'));
-      if(note)c.append(el('div','dim',note));
-      c.append(button('Close table',()=>leave(t.gid),'ghost'));
-    }else{c.append(para(note||'This table is closed.'),button('Dismiss',()=>leave(t.gid),'ghost'))}
-  }else if(g&&g.status==='joining'){
-    c.append(para('Asking '+t.host+' for a seat…'),button('Cancel',()=>leave(t.gid),'ghost'));
+  if(!t){
+    if(!S.gone[g.gid])c.append(para('Looking for '+(g.host===S.our?'your':g.host+'’s')+' table…','dim'));
+    else if(g.host===S.our)c.append(para('This table is closed.'),button('Reopen table',()=>act({host:{gid:g.gid}},'Could not reopen.')));
+    else c.append(para('This table is closed.'));
   }else{
-    c.append(para(t.host+' is hosting a Pong table. First to 11.'));
-    if(note)c.append(el('div','err',note));
-    c.append(button('Take the other paddle',()=>join(t.gid,t.host)));
+    const me=sideOf(t,S.our);
+    c.append(para((t.host===S.our?'Your table.':t.host+' is hosting.')+' First to 11. Anyone here can take an open paddle.','dim'));
+    c.append(seatRow(t,LEFT),seatRow(t,RIGHT));
+    if(t.left&&t.right)c.append(para('Score '+t.score[0]+' – '+t.score[1]));
+    const acts=el('div','row');
+    if(me!=null)acts.append(button('Stand up',standUp,'ghost'));
+    if(me==null&&t.left&&t.right)acts.append(button('Watch live',()=>{UI.watch=true;syncSession();renderUI()}));
+    if(t.host===S.our)acts.append(button('Close table',()=>act({close:{gid:g.gid}}),'ghost'));
+    if(acts.childNodes.length)c.append(acts);
+    if(me!=null&&!(t.left&&t.right))c.append(para('Waiting for someone to take the other paddle.','dim'));
+    const il=idleLeft();if(il!=null&&il<IDLE_WARN_MS)c.append(el('div','err',idleWarn(il)));
   }
+  if(note)c.append(el('div','err',note));
   if(UI.err)c.append(el('div','err',UI.err));
   return c;
 }
 function toolCard(){
   const c=el('div','card'),b=button(UI.busy?'Dropping…':'Drop table',dropTable);
   b.disabled=UI.busy;
-  c.append(para('Drop a Pong table into this note. Anyone here can take the other paddle — first to 11.'),b);
+  c.append(para('Drop a Pong table into this note. Anyone here can take a paddle — first to 11.'),b);
   if(UI.toolMsg)c.append(el('div','err',UI.toolMsg));
   return c;
 }
@@ -532,20 +807,20 @@ function place(box,node){
   box._html=html;box.textContent='';if(node)box.append(node);
 }
 function renderUI(){
-  const hadFocus=document.activeElement===shipInput;
-  let card=null,btn=null;
+  const hadFocus=document.activeElement===shipInput,btns=el('span','btns');
+  let card=null;
   if(!S.ready)card=msgCard(S.error?'OFFLINE':'CONNECTING',S.error||'Reaching your ship…');
   else if(UI.view==='tool')card=toolCard();
   else if(UI.view==='bad')card=msgCard('PONG','This artifact has no table in it.');
-  else if(isCpu())btn=button('Quit',quitCpu,'ghost');
-  else if(Net){const gid=Net.gid;btn=button('Leave',()=>leave(gid),'ghost')}
-  else if(UI.view==='table')card=tableCard();
-  else{
-    const g=UI.focus&&S.games[UI.focus];
-    if(UI.focus&&(!g||g.status!=='over'))UI.focus=null;
-    card=g&&UI.focus?endedCard(g):lobbyCard();
+  else if(isCpu())btns.append(button('Quit',quitCpu,'ghost'));
+  else if(UI.table){
+    if(Net&&Net.role==='player')btns.append(button('Stand up',standUp,'ghost'));
+    else if(Net&&Net.role==='watch')btns.append(button('Stop watching',()=>{UI.watch=false;syncSession();renderUI()},'ghost'));
+    else card=tableCard();
+    if(UI.fromLobby)btns.append(button('Back',backToLobby,'ghost'));
   }
-  place($('barBtns'),btn);place($('panel'),card);$('panel').hidden=!card;
+  else card=lobbyCard();
+  place($('barBtns'),btns.childNodes.length?btns:null);place($('panel'),card);$('panel').hidden=!card;
   const slot=$('panel').querySelector('[data-slot=ship]');if(slot)slot.replaceWith(shipInput);
   if(hadFocus&&shipInput.isConnected)shipInput.focus();
 }
@@ -555,15 +830,19 @@ let lastT=performance.now(),statusAt=0;
 function frame(now){
   const dt=Math.min(0.5,Math.max(0,(now-lastT)/1000));lastT=now;
   if(G){
-    if(pointerY!=null)G.pad[G.me]=clampPad(pointerY);
+    if(G.mode!=='watch'&&pointerY!=null)G.pad[G.me]=clampPad(pointerY);
     if(isCpu())cpuTick(dt);
     netTick(now);
-    if((G.phase==='count'||G.phase==='point')&&G.serveBy!=null&&mine(G.serveBy)&&now>=G.serveAt)serve();
+    if(G&&(G.phase==='count'||G.phase==='point')&&G.serveBy!=null&&mine(G.serveBy)&&now>=G.serveAt)serve();
+  }
+  if(G){
     G.acc+=dt;
     while(G.acc>=STEP){G.acc-=STEP;if(G.phase==='play')simStep(STEP)}
-    const o=1-G.me,k=1-Math.exp(-dt*30);
-    G.show[G.me]=G.pad[G.me];
-    G.show[o]=isCpu()?G.pad[o]:G.show[o]+(G.pad[o]-G.show[o])*k;
+    const k=1-Math.exp(-dt*30);
+    for(const side of [LEFT,RIGHT]){
+      if(G.mode==='cpu'||(G.mode==='net'&&side===G.me))G.show[side]=G.pad[side];
+      else G.show[side]+=(G.pad[side]-G.show[side])*k;
+    }
     const d=Math.exp(-dt*18);G.corr.x*=d;G.corr.y*=d;
   }
   draw();updateMsg(now);
@@ -585,7 +864,7 @@ addEventListener('message',e=>{
     const p=d.payload||{};
     if(p.ok){nbSend('nb:close');return}
     UI.busy=false;UI.toolMsg='Could not add the table to this note.';
-    if(UI.dropped){act({leave:{gid:UI.dropped}});UI.dropped=null}
+    if(UI.dropped){act({close:{gid:UI.dropped}});UI.dropped=null}
     renderUI();
   }
 });
@@ -615,7 +894,7 @@ function boot(ctx){
   }
   document.body.dataset.view=UI.view;
   if(UI.view==='tool')nbSend('nb:resize',{width:400,height:200});   // Noltbook's 42px header comes out of this
-  else if(mode==='note-artifact')nbSend('nb:resize',{height:480});
+  else if(mode==='note-artifact')nbSend('nb:resize',{height:500});
   fitCanvas();renderUI();connect();
 }
 addEventListener('resize',fitCanvas);

@@ -1,31 +1,21 @@
-::  sur/pong -- lobby and relay vocabulary for %pong.
+::  sur/pong -- tables, seats and the ship-to-ship vocabulary for %pong.
 ::
-::  The agent only seats players and carries messages between them.  Ball
-::  physics, paddles and score live in the two browsers; to the agent a
-::  game message is an opaque cord (body) addressed to the opponent.
+::  A table lives on the ship that opened it (its host).  The host's agent
+::  decides who holds which paddle: first come, first served.  Other ships
+::  follow a table to see its seats and score.  The game itself runs in the
+::  players' browsers, which talk to each other directly over WebRTC and
+::  fall back to %relay through their ships when they can't.
 ::
 |%
 +$  gid  @t
++$  side  ?(%l %r)
 ::
-::  status: where a game stands, from OUR side
-::
-+$  status
-  $?  %open                                     ::  hosting, anyone may join
-      %invited                                  ::  hosting, waiting on a guest
-      %incoming                                 ::  challenged by someone else
-      %joining                                  ::  asked a host for a seat
-      %live                                     ::  both players seated
-      %over                                     ::  ended, or a join failed
-  ==
-::
-::  open: an open table returns to %open when its guest leaves;
-::  a direct challenge ends instead.
-::
-+$  game
++$  table
   $:  host=@p
-      guest=(unit @p)
-      =status
-      open=?
+      left=(unit @p)                            ::  left paddle
+      right=(unit @p)                           ::  right paddle
+      invite=(unit @p)                          ::  right paddle held for
+      score=[l=@ud r=@ud]                       ::  as the players report it
       created=@da
   ==
 ::
@@ -33,20 +23,35 @@
 ::
 +$  action
   $%  [%host =gid]                              ::  open a table
-      [%challenge =gid who=@p]                  ::  invite one ship
-      [%join =gid host=@p]                      ::  take a seat
-      [%leave =gid]                             ::  decline/cancel/quit/dismiss
-      [%relay =gid body=@t]                     ::  game message to opponent
+      [%challenge =gid who=@p]                  ::  open, sit left, invite
+      [%follow =gid host=@p]                    ::  see seats and score
+      [%sit =gid host=@p =side]
+      [%stand =gid host=@p]
+      [%score =gid host=@p l=@ud r=@ud]
+      [%here =gid host=@p]                      ::  still at the table
+      [%close =gid]                             ::  shut a table we host
+      [%dismiss =gid]                           ::  forget a table or invite
+      [%relay =gid to=@p body=@t]               ::  to a page on another ship
   ==
 ::
 ::  msg: ship to ship
 ::
 +$  msg
-  $%  [%invite =gid]                            ::  host -> guest
-      [%join =gid]                              ::  guest -> host
-      [%seat =gid]                              ::  host -> guest: you're in
-      [%refuse =gid why=@t]                     ::  host -> guest: no seat
-      [%leave =gid]                             ::  either way
-      [%relay =gid body=@t]                     ::  either way
+  $%  [%invite =gid]                            ::  host -> invitee
+      [%decline =gid]                           ::  invitee -> host
+      [%sit =gid =side]                         ::  -> host
+      [%stand =gid]                             ::  -> host
+      [%score =gid l=@ud r=@ud]                 ::  player -> host
+      [%here =gid]                              ::  player -> host, heartbeat
+      [%refuse =gid why=@t]                     ::  host -> asker
+      [%relay =gid body=@t]                     ::  page to page
+  ==
+::
+::  update: host -> followers, on /table/<gid>.  A closed table keeps its
+::  followers, so reopening it reaches them.
+::
++$  update
+  $%  [%table =gid =table]
+      [%closed =gid]
   ==
 --

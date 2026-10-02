@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Pong</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%2264%22 height=%2264%22 viewBox=%220 0 64 64%22%3E%3Crect width=%2264%22 height=%2264%22 fill=%22%23000%22/%3E%3Crect x=%229%22 y=%2214%22 width=%226%22 height=%2220%22 fill=%22%23f2f2f2%22/%3E%3Crect x=%2249%22 y=%2230%22 width=%226%22 height=%2220%22 fill=%22%23f2f2f2%22/%3E%3Crect x=%2233%22 y=%2223%22 width=%226%22 height=%226%22 fill=%22%23f2f2f2%22/%3E%3C/svg%3E">
 <style>
 :root{color-scheme:dark;--bg:#000;--fg:#f2f2f2;--dim:#8c8c8c;--line:#2b2b2b;--err:#ff6b6b}
 *{box-sizing:border-box}
@@ -28,10 +29,11 @@ input:focus{outline:none;border-color:var(--fg)}
 .card h2:first-child{margin-top:0}
 .card p{margin:0}
 .row{display:flex;gap:8px;align-items:center}
+.row.end{justify-content:flex-end}
 .list{display:flex;flex-direction:column;gap:6px}
 .item{display:flex;gap:6px;align-items:center;border:1px solid var(--line);padding:6px 8px;min-height:36px}
 .item .who{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.item .lbl{color:var(--dim);width:6.5em;flex:none}
+.item .lbl{color:var(--dim);width:8.5em;flex:none;white-space:nowrap}
 .dim{color:var(--dim)}
 .err{color:var(--err)}
 .msg{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);display:flex;flex-direction:column;align-items:center;gap:10px;text-align:center;pointer-events:none;padding:14px 20px;background:rgba(0,0,0,.65);max-width:calc(100% - 32px)}
@@ -53,7 +55,7 @@ body[data-view=tool] .card{border:0;padding:0;width:100%;gap:12px}
     <span id="barBtns" class="btns"></span>
   </header>
   <main id="stage">
-    <canvas id="field" width="800" height="500"></canvas>
+    <canvas id="field" width="800" height="512"></canvas>
     <div id="msg" class="msg" hidden></div>
     <div id="panel" class="panel" hidden></div>
   </main>
@@ -82,7 +84,12 @@ const W=800,H=500,BALL=12,PW=12,PH=80,PX=24;
 const LFACE=PX+PW,RFACE=W-PX-PW;                // the faces the ball strikes
 const LEFT=0,RIGHT=1;
 const SPEED0=420,SPEEDUP=1.05,SPEEDMAX=980,MAXANG=Math.PI*0.3;
-const CPU_SPEED=320,CPU_ERR=0.65,CPU_REACT=0.4;   // tuned so a 90% returner wins ~58% of points
+// CPU: predicts where the ball will reach its paddle (bounces included), takes a
+// moment to read each shot, misjudges more on fast balls, and aims off-centre to
+// send the ball away from you. Tuned offline: a player who returns 90% of balls
+// wins ~46% of points (rallies ~10 hits), 75% wins ~17%.
+const CPU_SPEED=420,CPU_ACCEL=3000,CPU_REACT=[0.14,0.26],CPU_ERR=0.08,CPU_FLOOR=0.30,CPU_WHIFF=0.04,CPU_AIM=[0.25,0.75];
+const WT=6,VH=H+2*WT;                            // walls drawn outside the field: physics unchanged
 const STEP=1/240,WIN=11;
 const SERVE_MS=1000,COUNT_MS=3000,PING_MS=2000,HI_MS=1000,STALL_MS=5000;
 const PADDLE_RELAY_MS=60,PADDLE_RTC_MS=33;       // ship path is dearer, so sparser
@@ -213,6 +220,24 @@ async function act(json,failText){
   }
   return !err;
 }
+// Noltbook display names, read from this ship's own %noltbook. A ship without
+// Noltbook, or one with no name set, shows as its @p.
+const Names={};
+function nameOf(ship){
+  if(typeof ship!=='string'||!ship)return '';
+  const e=Names[ship];
+  if(!e||Date.now()-e.at>600000)lookupName(ship);
+  return (e&&e.name)||ship;
+}
+function lookupName(ship){
+  const prev=Names[ship];Names[ship]={name:prev?prev.name:null,at:Date.now()};
+  fetch('/~/scry/noltbook/api/profile/'+encodeURIComponent(ship)+'.json',{credentials:'include'})
+    .then(r=>r.ok?r.json():null)
+    .then(j=>{const n=j&&typeof j.displayName==='string'?j.displayName.trim().slice(0,40):'';if(n!==(Names[ship].name||'')){Names[ship].name=n||null;renderUI()}})
+    .catch(()=>{});
+}
+const named=text=>String(text).replace(/~[a-z]{3,6}(?:-[a-z]{6})*/g,s=>nameOf(s));   // notes from the agent
+const clip=(s,n)=>s.length>n?s.slice(0,n-1)+'…':s;
 const curT=()=>UI.table&&S.tables[UI.table.gid];
 const sideOf=(t,ship)=>!t?null:t.left===ship?LEFT:t.right===ship?RIGHT:null;
 function follow(){if(UI.table&&S.ready)pokeQuiet({follow:{gid:UI.table.gid,host:UI.table.host}})}
@@ -565,7 +590,8 @@ function newGame(mode,me){
   return{mode,me,m:0,via:null,pad:[H/2,H/2],show:[H/2,H/2],score:[0,0],
     ball:{x:W/2-BALL/2,y:H/2-BALL/2,vx:0,vy:0,live:false,spec:false,frozen:false},
     k:0,phase:'wait',countEnd:0,serveAt:0,serveBy:null,serveDir:0,
-    corr:{x:0,y:0},predHit:false,wantAgain:false,peerAgain:false,cpuErr:0,acc:0};
+    corr:{x:0,y:0},predHit:false,wantAgain:false,peerAgain:false,
+    cpuK:-1,cpuV:0,cpuReact:0,cpuErr:0,cpuAim:0,acc:0};
 }
 const mine=side=>G.mode==='cpu'||(G.mode==='net'&&side===G.me);
 function startMatch(m,via){
@@ -614,7 +640,6 @@ function bounce(side){
   const sp=Math.min(SPEEDMAX,Math.hypot(b.vx,b.vy)*SPEEDUP),a=rel*MAXANG;
   b.vx=(side===LEFT?1:-1)*sp*Math.cos(a);b.vy=sp*Math.sin(a);
   b.x=side===LEFT?LFACE:RFACE-BALL;
-  if(G.mode==='cpu'&&side===LEFT)G.cpuErr=(Math.random()*2-1)*PH*CPU_ERR;
 }
 function goal(side){
   if(mine(side)&&!G.ball.spec){concede(side);return}
@@ -660,19 +685,43 @@ function askRematch(){
   G.wantAgain=true;sendPeer({t:'again',m:G.m});maybeRematch();
 }
 function maybeRematch(){if(Net&&Net.lead&&G.phase==='over'&&G.wantAgain&&G.peerAgain)hostStart()}
-function cpuTick(dt){
-  const b=G.ball,target=(b.live&&b.vx>0&&b.x>W*CPU_REACT)?b.y+BALL/2+G.cpuErr:H/2,cur=G.pad[RIGHT],step=CPU_SPEED*dt;
-  G.pad[RIGHT]=clampPad(cur+Math.max(-step,Math.min(step,target-cur)));
+const gauss=()=>{let u=0,v=0;while(!u)u=Math.random();while(!v)v=Math.random();return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v)};
+// where (centre y) and when the ball reaches the CPU's paddle face, walls folded in
+function cpuPredict(b){
+  const t=(RFACE-(b.x+BALL))/b.vx;if(t<0)return{y:b.y+BALL/2,t:0};
+  const span=H-BALL,P=2*span;let y=(b.y+b.vy*t)%P;if(y<0)y+=P;if(y>span)y=P-y;
+  return{y:y+BALL/2,t};
 }
+function cpuTick(dt,now){
+  const b=G.ball;let target=H/2,urgent=false;
+  if(b.live&&!b.frozen&&b.vx>0){
+    if(G.cpuK!==G.k){                               // a new shot is coming: read it, then plan
+      G.cpuK=G.k;
+      G.cpuReact=now+1000*(CPU_REACT[0]+Math.random()*(CPU_REACT[1]-CPU_REACT[0]));
+      G.cpuErr=gauss()*Math.hypot(b.vx,b.vy)*CPU_ERR*(Math.random()<CPU_WHIFF?3:1);
+      G.cpuAim=(G.pad[LEFT]<H/2?1:-1)*(CPU_AIM[0]+Math.random()*(CPU_AIM[1]-CPU_AIM[0]));
+    }
+    if(now>=G.cpuReact){
+      const p=cpuPredict(b),near=Math.max(CPU_FLOOR,Math.min(1,p.t/0.9));   // the guess firms up as it closes in
+      target=p.y+G.cpuErr*near-G.cpuAim*(PH/2+BALL/2);urgent=true;
+    }else target=G.pad[RIGHT];                     // still reading the shot
+  }
+  const cur=G.pad[RIGHT],want=Math.max(-CPU_SPEED,Math.min(CPU_SPEED,(target-cur)*(urgent?9:3)));
+  const mdv=CPU_ACCEL*dt;G.cpuV+=Math.max(-mdv,Math.min(mdv,want-G.cpuV));
+  G.pad[RIGHT]=clampPad(cur+G.cpuV*dt);
+  if(G.pad[RIGHT]===PH/2||G.pad[RIGHT]===H-PH/2)G.cpuV=0;
+}
+// practice runs in place: from a table it plays over the table view, and quitting
+// returns to it (the table keeps updating meanwhile)
 function startCpu(){
-  endSession();UI.table=null;
+  endSession();UI.watch=false;
   G=newGame('cpu',LEFT);startMatch(0);renderUI();
 }
-function quitCpu(){G=null;renderUI()}
+function quitCpu(){G=null;syncSession();renderUI()}
 
 // ---------- input ----------
 let pointerY=null;
-function onPointer(e){const r=cv.getBoundingClientRect();if(r.height>0)pointerY=(e.clientY-r.top)/r.height*H}
+function onPointer(e){const r=cv.getBoundingClientRect();if(r.height>0)pointerY=(e.clientY-r.top)/r.height*VH-WT}
 addEventListener('pointermove',onPointer,{passive:true});
 addEventListener('pointerdown',onPointer,{passive:true});
 
@@ -682,8 +731,9 @@ const DIG=['111101101101111','010110010010111','111001111100111','11100111100111
            '111100111001111','111100111101111','111001001001001','111101111101111','111101111001111'];
 function fitCanvas(){
   const r=$('stage').getBoundingClientRect();
-  let w=Math.max(100,r.width-16),h=w/1.6;
-  if(h>r.height-16){h=Math.max(62,r.height-16);w=h*1.6}
+  const ar=W/VH;
+  let w=Math.max(100,r.width-16),h=w/ar;
+  if(h>r.height-16){h=Math.max(62,r.height-16);w=h*ar}
   cv.style.width=Math.floor(w)+'px';cv.style.height=Math.floor(h)+'px';
   const dpr=Math.min(2,window.devicePixelRatio||1);
   cv.width=Math.round(w*dpr);cv.height=Math.round(h*dpr);
@@ -701,13 +751,15 @@ const IDLE=newGame('idle',LEFT);
 function seatNames(){
   if(isCpu())return['you','cpu'];
   const t=curT();if(!t)return null;
-  const n=s=>!s?'':s===S.our?'you':s;
+  const n=s=>!s?'':s===S.our?'you':clip(nameOf(s),20);
   return[n(t.left),n(t.right)];
 }
 function draw(){
   const s=cv.width/W,g=G||IDLE,b=g.ball,t=!G&&curT();
   ctx.setTransform(s,0,0,s,0,0);
-  ctx.fillStyle='#000';ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#000';ctx.fillRect(0,0,W,VH);
+  ctx.fillStyle='#bdbdbd';ctx.fillRect(0,0,W,WT);ctx.fillRect(0,VH-WT,W,WT);   // top and bottom walls
+  ctx.translate(0,WT);
   ctx.fillStyle='#555';for(let y=6;y<H;y+=26)ctx.fillRect(W/2-2,y,4,14);
   ctx.fillStyle='#f2f2f2';
   const sc=t?t.score:g.score;
@@ -729,7 +781,7 @@ function msgState(now){
   const il=G.mode==='net'?idleLeft():null;
   if(il!=null&&il<IDLE_WARN_MS)return{key:'idle'+Math.ceil(il/1000),text:idleWarn(il)};
   const watch=G.mode==='watch',names=seatNames()||['',''];
-  const them=isCpu()?'CPU':Net&&Net.role==='player'?Net.them:'';
+  const them=isCpu()?'CPU':Net&&Net.role==='player'?nameOf(Net.them):'';
   if(watch&&!Net.linked)return{key:'wconn',text:'Connecting to the game…'};
   if(G.mode==='net'&&!Net.linked)return{key:'wait',text:'Waiting for '+them+' to open the game…'};
   if(G.mode==='net'&&!G.m)return{key:'conn',text:'Connecting…'};
@@ -765,11 +817,11 @@ function statusText(){
   if(isCpu())return 'practice vs CPU';
   if(Net&&Net.role==='player'){
     const path=!G.m?'':G.via==='rtc'?' · direct':' · via ships';
-    return (Net.me===LEFT?'left':'right')+' paddle vs '+Net.them+(Net.linked?' · '+Math.round(Net.rtt)+' ms'+path:'');
+    return (Net.me===LEFT?'left':'right')+' paddle vs '+nameOf(Net.them)+(Net.linked?' · '+Math.round(Net.rtt)+' ms'+path:'');
   }
   if(Net&&Net.role==='watch')return 'watching'+(Net.linked?' · '+Math.round(Net.rtt)+' ms':'');
-  if(UI.table)return UI.table.host===S.our?'your table':UI.table.host+'’s table';
-  return S.our||'';
+  if(UI.table)return UI.table.host===S.our?'your table':nameOf(UI.table.host)+'’s table';
+  return S.our?nameOf(S.our):'';
 }
 
 // ---------- panels ----------
@@ -783,9 +835,9 @@ async function challenge(){
   if(await act({challenge:{gid,who:v}},'Challenge failed.')){shipInput.value='';openTable(gid,S.our)}
 }
 function tableLabel(t){
-  const who=[t.left,t.right].map(s=>s===S.our?'you':s);
+  const who=[t.left,t.right].map(s=>!s?s:s===S.our?'you':nameOf(s));
   const seats=t.left&&t.right?who[0]+' vs '+who[1]:(who[0]||who[1]||'nobody')+' seated';
-  return (t.host===S.our?'Your table':t.host+'’s table')+' — '+seats;
+  return (t.host===S.our?'Your table':nameOf(t.host)+'’s table')+' — '+seats;
 }
 function lobbyCard(){
   const c=el('div','card'),row=el('div','row');
@@ -797,7 +849,7 @@ function lobbyCard(){
   if(inv.length){
     const list=el('div','list');
     for(const [gid,host] of inv){
-      const it=el('div','item'),who=el('div','who',host+' challenges you');
+      const it=el('div','item'),who=el('div','who',nameOf(host)+' challenges you');who.title=host;
       it.append(who,button('Play',()=>{openTable(gid,host);sit(RIGHT)}),button('Decline',()=>act({dismiss:{gid}}),'ghost'));
       list.append(it);
     }
@@ -821,24 +873,25 @@ function forget(t){if(sideOf(t,S.our)!=null)act({stand:{gid:t.gid,host:t.host}})
 function seatRow(t,side){
   const who=side===LEFT?t.left:t.right,me=sideOf(t,S.our),row=el('div','item');
   row.append(el('span','lbl',side===LEFT?'Left paddle':'Right paddle'));
-  let text=who?(who===S.our?'you':who):'open';
+  let text=who?(who===S.our?'you':nameOf(who)):'open';
   const held=side===RIGHT&&!who&&t.invite&&t.invite!==S.our;
-  if(held)text='saved for '+t.invite;
-  const w=el('span','who'+(who?'':' dim'),text);w.title=text;row.append(w);
-  if(!who&&me==null&&!held)row.append(button('Take it',()=>sit(side)));
+  if(held)text='saved for '+nameOf(t.invite);
+  const w=el('span','who'+(who?'':' dim'),text);w.title=who||(held?t.invite:text);row.append(w);
+  if(!who&&me==null&&!held)row.append(button('Pick up',()=>sit(side)));
   return row;
 }
 function tableCard(){
   const g=UI.table,t=curT(),c=el('div','card'),note=S.notes[g.gid];
   c.append(el('h2',null,'PONG TABLE'));
   if(!t){
-    if(!S.gone[g.gid])c.append(para('Looking for '+(g.host===S.our?'your':g.host+'’s')+' table…','dim'));
+    if(!S.gone[g.gid])c.append(para('Looking for '+(g.host===S.our?'your':nameOf(g.host)+'’s')+' table…','dim'));
     else if(g.host===S.our)c.append(para('This table is closed.'),button('Reopen table',()=>act({host:{gid:g.gid}},'Could not reopen.')));
     else c.append(para('This table is closed.'));
   }else{
     const me=sideOf(t,S.our);
-    c.append(para((t.host===S.our?'Your table.':t.host+' is hosting.')+' First to 11. Anyone here can take an open paddle.','dim'));
+    c.append(para((t.host===S.our?'Your table.':nameOf(t.host)+' is hosting.')+' First to 11. Anyone here can take an open paddle.','dim'));
     c.append(seatRow(t,LEFT),seatRow(t,RIGHT));
+    if(me==null){const r=el('div','row end');r.append(button('Play vs CPU',startCpu));c.append(r)}
     if(t.left&&t.right)c.append(para('Score '+t.score[0]+' – '+t.score[1]));
     const acts=el('div','row');
     const away=me!=null&&heldElsewhere(g.gid);
@@ -851,7 +904,7 @@ function tableCard(){
     if(me!=null&&!away&&!(t.left&&t.right))c.append(para('Waiting for someone to take the other paddle.','dim'));
     const il=idleLeft();if(il!=null&&il<IDLE_WARN_MS)c.append(el('div','err',idleWarn(il)));
   }
-  if(note)c.append(el('div','err',note));
+  if(note)c.append(el('div','err',named(note)));
   if(UI.err)c.append(el('div','err',UI.err));
   return c;
 }
@@ -895,7 +948,7 @@ function frame(now){
   const dt=Math.min(0.5,Math.max(0,(now-lastT)/1000));lastT=now;
   if(G){
     if(G.mode!=='watch'&&pointerY!=null)G.pad[G.me]=clampPad(pointerY);
-    if(isCpu())cpuTick(dt);
+    if(isCpu())cpuTick(dt,now);
     netTick(now);
     if(G&&(G.phase==='count'||G.phase==='point')&&G.serveBy!=null&&mine(G.serveBy)&&now>=G.serveAt)serve();
   }

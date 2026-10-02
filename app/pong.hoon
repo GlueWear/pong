@@ -45,7 +45,7 @@
 ::
 ++  manifest
   ^-  @t
-  '{"noltbookVersion":"365K","version":"0.2.2","title":"Pong","summary":"Ship-vs-ship Pong. First to 11.","permissions":["media"],"launch":{"href":"/apps/pong","target":"embedded","width":900,"height":640,"media":true},"artifact":{"label":"Pong","href":"/apps/pong","width":660,"height":520,"media":true},"actions":[{"id":"open","kind":"open","label":"Play Pong","description":"Challenge a ship or practice against the CPU.","href":"/apps/pong","target":"embedded","width":900,"height":640,"media":true}]}'
+  '{"noltbookVersion":"365K","version":"0.2.5","title":"Pong","summary":"Ship-vs-ship Pong. First to 11.","permissions":["media"],"launch":{"href":"/apps/pong","target":"embedded","width":900,"height":640,"media":true},"artifact":{"label":"Pong","href":"/apps/pong","width":660,"height":520,"media":true},"actions":[{"id":"open","kind":"open","label":"Play Pong","description":"Challenge a ship or practice against the CPU.","href":"/apps/pong","target":"embedded","width":900,"height":640,"media":true}]}'
 ::
 ++  gid-ok
   |=  =gid:pong
